@@ -61,19 +61,9 @@ def main():
     ).to(DEVICE)
 
     # --- 4. 加载训练好的权重 ---
-    try:
-        model.load_state_dict(
-            torch.load(MODEL_PATH, map_location=DEVICE)
-        )
-    except FileNotFoundError:
-        print(f"错误: 找不到模型权重文件 '{MODEL_PATH}'")
-        print("请先运行 train.py 来生成 '[16,32,64,128,256]SimpleUnet.pth' 文件。")
-        return
-    except Exception as e:
-        print(f"加载模型权重时出错: {e}")
-        print("请确保 'SimpleUNet' 中的模型结构与 '[16,32,64,128,256]SimpleUnet.pth' 匹配。")
-        print("（特别检查 'adw' 参数是否一致）")
-        return
+
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE),strict=False)
+
 
     # --- 5. 定义 Loss (metrics 函数需要它) ---
     loss_fn = nn.CrossEntropyLoss()

@@ -19,13 +19,16 @@ DATA_PATH = r"D:\对照试验模型\dataset\9-isic2018"
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 BATCH_SIZE = 8
-NUM_EPOCHS = 30
+NUM_EPOCHS = 300
 NUM_WORKERS = 4
 IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 256
 PIN_MEMORY = True
 NUM_CLASSES = 2  # 0: 背景, 1: 病灶
-SAVE_PATH = "isic-2018-[64,128,256,512,1024]"
+SAVE_PATH = "Wavelet-isic-2018-[16,16,16,16,16]"
+early_stop_patience = 10  # 你要求的10轮
+early_stop_counter = 0    # 计数器
+stage_channels = [16,16,16,16,16]
 
 
 def train_fn(loader, model, optimizer, loss_fn, device):
@@ -78,7 +81,7 @@ def main():
     model = SimpleUNet(
         in_channels=3,
         num_cls=NUM_CLASSES,
-        stage_channels=[64,128,256,512,1024],
+        stage_channels=stage_channels,
         num_blocks=[1, 1, 1, 1, 1],
         short_rate=0.5,
         #adw=True
@@ -151,9 +154,22 @@ def main():
             print(f"==> New best model found! Foreground IoU: {IoU_foreground:.4f}")
             torch.save(model.state_dict(), SAVE_PATH)
 
-        if Dice_foreground > best_dice_fg:
-            best_dice_fg = Dice_foreground
-            print(f"==> New best model found! Foreground Dice: {Dice_foreground:.4f}")
+            # 2. 检查 Dice 并执行早停逻辑
+            # (这替换了你原来 'if Dice_foreground > best_dice_fg:' 的简单判断)
+            if Dice_foreground > best_dice_fg:
+                best_dice_fg = Dice_foreground
+                print(f"==> New best Dice found! Foreground Dice: {Dice_foreground:.4f}")
+                # Dice 提升了，重置早停计数器
+                early_stop_counter = 0
+            else:
+                # Dice 没有提升，计数器+1
+                early_stop_counter += 1
+                print(f"Early stopping counter: {early_stop_counter} / {early_stop_patience}")
+
+            # 3. 检查是否触发早停
+            if early_stop_counter >= early_stop_patience:
+                print(f"\nEarly stopping triggered: Dice score did not improve for {early_stop_patience} epochs.")
+                break  # 中断训练循环
 
     print("\nTraining finished.")
     print(f"Best validation Foreground IoU: {best_iou_fg:.4f}")
