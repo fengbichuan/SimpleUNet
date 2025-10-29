@@ -2,23 +2,34 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from thop import profile
-
+from CConv import CosinConv2D
 
 # ----------------------------------------------------------------------
-# 1. 基础卷积块 (不变)
+# 1. 基础卷积块 (修改版)
 # ----------------------------------------------------------------------
 class SingleConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, pad=1, dilation=1):
+    def __init__(self, in_channels, out_channels, kernel_size=3, pad=1, dilation=1, use_cosine_conv=False):
         super().__init__()
+
+
         self.single_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=pad, dilation=dilation, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
+                CosinConv2D(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    padding=pad,
+                    stride=1,  # 假设 stride 总是 1
+                    groups=1  # 假设 groups 总是 1
+                ),
+                nn.BatchNorm2d(out_channels),
+                # nn.ReLU(inplace=True)
+                # !!! 注意：移除了 ReLU !!!
+                # CosinConv2D 已经是非线性的，ReLU 会破坏负相似性信息
+            )
+
 
     def forward(self, x):
         return self.single_conv(x)
-
 
 # ----------------------------------------------------------------------
 # 2. 编码器 (下采样) 模块 (不变)
