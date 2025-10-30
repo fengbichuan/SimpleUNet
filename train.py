@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
+import csv  # [新增] 导入 CSV 库
 
 from thop import profile
 from tqdm import tqdm
@@ -18,17 +19,17 @@ DATA_PATH = r"D:\对照试验模型\dataset\9-isic2018"
 # 超参数
 LEARNING_RATE = 0.0003
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 64
+BATCH_SIZE = 8
 NUM_EPOCHS = 300
 NUM_WORKERS = 4
 IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 256
 PIN_MEMORY = True
 NUM_CLASSES = 1  # <-- 修改点: 二分类 (BCE) 模式下, 输出通道为 1
-SAVE_PATH = "Wavelet-isic-2018-[16,16,16,16,16]-BCE-test1" # <-- 修改点: 更改保存名称
+SAVE_PATH = "Wavelet-isic-2018-[16,16,16,16,16]-BCE-test1"  # <-- 修改点: 更改保存名称1
 early_stop_patience = 20
 early_stop_counter = 0
-stage_channels = [16,16,16,16,16]
+stage_channels = [64, 128, 256, 512, 1024]
 
 
 def train_fn(loader, model, optimizer, loss_fn, device):
@@ -63,6 +64,28 @@ def train_fn(loader, model, optimizer, loss_fn, device):
     avg_loss = running_loss / len(loader)
     print(f"Train Epoch Loss: {avg_loss:.4f}")
 
+    return avg_loss  # [修改] 返回平均训练损失
+
+
+# [新增] 保存结果到 CSV 文件的函数
+def save_results_to_csv(filepath, header, data_rows):
+    """
+    将结果列表保存到 CSV 文件
+    :param filepath: CSV 文件的保存路径
+    :param header: CSV 文件的表头 (list of strings)
+    :param data_rows: 包含指标数据的列表 (list of lists)
+    """
+    try:
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # 写入表头
+            writer.writerow(header)
+            # 写入所有数据行
+            writer.writerows(data_rows)
+        print(f"Metrics successfully saved to {filepath}")
+    except Exception as e:
+        print(f"Error saving CSV to {filepath}: {e}")
+
 
 def main():
     global early_stop_counter
@@ -85,7 +108,7 @@ def main():
         stage_channels=stage_channels,
         num_blocks=[1, 1, 1, 1, 1],
         short_rate=0.5,
-        #adw=True
+        # adw=True
     ).to(DEVICE)
 
     # <--- 2. Params 和 FLOPs 计算 (这部分不受影响) ---
@@ -114,11 +137,18 @@ def main():
     # --- 4. 训练循环 ---
     best_iou_fg = -1.0
     best_dice_fg = -1.0
+
+    # [新增] 用于存储 CSV 结果的列表和表头
+    results_list = []
+    csv_header = ["Epoch", "Train Loss", "Val Loss", "Val IoU (FG)", "Val Dice (FG)"]
+    # [新增] 定义 CSV 文件的保存路径 (基于模型保存路径)
+    csv_save_path = f"{SAVE_PATH}.csv"
+
     for epoch in range(NUM_EPOCHS):
         print(f"\n--- Epoch {epoch + 1}/{NUM_EPOCHS} ---")
 
-        # 训练
-        train_fn(train_loader, model, optimizer, loss_fn, DEVICE)
+        # 训练 [修改] 接收 train_loss
+        train_loss = train_fn(train_loader, model, optimizer, loss_fn, DEVICE)
 
         # <-- 修改点: 新的评估函数不再需要 num_cls，且返回的直接是前景指标
         val_loss, IoU_foreground, Dice_foreground = calculate_metrics_and_loss(
@@ -129,6 +159,10 @@ def main():
         print(f"  Avg Loss: {val_loss:.4f}")
         print(f"  IoU (Foreground):     {IoU_foreground:.4f}")
         print(f"  Dice (Foreground):    {Dice_foreground:.4f}")
+
+        # [新增] 将本轮次的结果添加到列表中
+        epoch_data = [epoch + 1, train_loss, val_loss, IoU_foreground, Dice_foreground]
+        results_list.append(epoch_data)
 
         # 1. (可选) 更新学习率调度器 (基于 Dice)
         scheduler.step(Dice_foreground)
@@ -157,6 +191,9 @@ def main():
     print(f"Best validation Foreground IoU: {best_iou_fg:.4f}")
     print(f"Best validation Foreground Dice: {best_dice_fg:.4f}")
     print(f"Best model saved to {SAVE_PATH}")
+
+    # [新增] 在训练结束后，调用函数保存 CSV
+    save_results_to_csv(csv_save_path, csv_header, results_list)
 
 
 if __name__ == "__main__":

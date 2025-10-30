@@ -1,17 +1,20 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from thop import profile
+# (!!! 新增 !!!) 导入 VolSelfAttention 需要的库
+from einops import rearrange
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 
 # ----------------------------------------------------------------------
-# 0. 您提供的 Converse2D 模块 (粘贴在此处以便 Decoder 调用)
+# 0. 您提供的 Converse2D 模块 (不变)
 # ----------------------------------------------------------------------
 class Converse2D(nn.Module):
     """
     Converse2D: 频域闭式解型上采样-去卷积算子（深度可分）
-    用途：图像复原/超分重构。先将输入做 s-fold 上采样，再在频域中解耦点扩散核 PSF 的影响，
-          通过 OTF(=FFT(psf)) 与先验项（可学习偏置）得到闭式解近似。
+    ... (代码与您提供的一致，此处折叠) ...
     """
 
     def __init__(
@@ -141,7 +144,201 @@ class Converse2D(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 1. 基础卷积块 (不变)
+# (!!! 新增 !!!) 1. VolSelfAttention 及其依赖
+# ----------------------------------------------------------------------
+class DecayPos1d(nn.Module):
+    """
+    1D 衰减相对位置先验（按 head 设定不同衰减速率）
+    ... (代码与您提供的一致，此处折叠) ...
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int, initial_value: float, heads_range: float):
+        super().__init__()
+        # 频率角频率（未直接用到，保留以兼容可能的扩展）
+        angle = 1.0 / (10000 ** torch.linspace(0, 1, embed_dim // num_heads // 2))
+        angle = angle.unsqueeze(-1).repeat(1, 2).flatten()
+        self.initial_value = initial_value
+        self.heads_range = heads_range
+        self.num_heads = num_heads
+        # 每个 head 一个衰减速率（越靠后 head 衰减越慢/快，取决于 heads_range）
+        decay = torch.log(
+            1 - 2 ** (-initial_value - heads_range * torch.arange(num_heads, dtype=torch.float) / num_heads))
+        self.register_buffer('angle', angle)
+        self.register_buffer('decay', decay)
+
+    def generate_1d_decay(self, l: int) -> torch.Tensor:
+        idx = torch.arange(l, device=self.decay.device)
+        dist = (idx[:, None] - idx[None, :]).abs()  # (L, L)
+        mask = dist * self.decay[:, None, None]  # (H, L, L)
+        return mask
+
+    def forward(self, slen: int) -> torch.Tensor:
+        return self.generate_1d_decay(int(slen))
+
+
+class VolSelfAttention(nn.Module):
+    """
+    Volumetric Self-Attention
+    ... (代码与您提供的一致，此处折叠) ...
+    """
+
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size  # (Wh, Ww)
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+
+        # 相对位置偏置
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
+        )
+
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # (2, Wh, Ww)
+        coords_flatten = torch.flatten(coords, 1)  # (2, Wh*Ww)
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # (2, N, N)
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # (N, N, 2)
+        relative_coords[:, :, 0] += self.window_size[0] - 1
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)  # (N, N)
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        # token 自注意力（线性投影）
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        # 频谱位置先验：按 head 提供 (H, C_per_head, C_per_head) 的衰减偏置
+        self.realPos = DecayPos1d(embed_dim=64, num_heads=num_heads, initial_value=2, heads_range=4)
+
+        # 频谱分支：Conv1x1 + 深度可分离卷积
+        self.qkv_C = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=False)
+        self.qkv_dwconv_C = nn.Conv2d(dim * 3, dim * 3, kernel_size=3, stride=1, padding=1, groups=dim * 3, bias=False)
+        self.proj_C = nn.Conv2d(dim, dim, kernel_size=1)
+
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.softmax = nn.Softmax(dim=-1)
+
+        # 简单空间注意力门控（把 (B,H,N,N) 池化成 (B,N,1) 作为加权）
+        self.Gao_spatial_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(num_heads, 32, 3, 1, 1),
+            nn.BatchNorm2d(32),
+            nn.Conv2d(32, 64, 3, 1, 1),
+        )
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        x: (B, N, C)，其中 N=Wh*Ww 必须与 window_size 匹配
+        return: (B, N, C)
+        """
+        B, N, C = x.shape
+        Wh, Ww = self.window_size
+        assert N == Wh * Ww, f"N ({N}) 必须等于 window_size={self.window_size} 的乘积"
+        # (!!!) 注意：这里的 hh * hh == N 约束了 N 必须是完全平方数
+        # (!!!) 对于 (8,8) 窗口, N=64, hh=8, 这是 OK 的
+        hh = int(math.isqrt(N))
+        assert hh * hh == N, "N 应为完全平方数，确保可重排为 (hh, hh)"
+
+        # -------- Token 维自注意力 --------
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B, H, N, C//H)
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))  # (B, H, N, N)
+
+        # 相对位置偏置
+        rel_pos = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(N, N, -1)  # (N,N,H)
+        rel_pos = rel_pos.permute(2, 0, 1).contiguous()  # (H,N,N)
+        attn = attn + rel_pos.unsqueeze(0)  # (B,H,N,N)
+
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+
+        attn = self.softmax(attn)
+        attn = self.attn_drop(attn)
+
+        x1 = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x1 = self.proj_drop(self.proj(x1))
+
+        # -------- 频谱/通道重排分支 --------
+        # 频谱先验（按每头通道数）
+        c_per_head = C // self.num_heads
+        realPos = self.realPos(c_per_head)  # (H, CpH, CpH)
+
+        x_s = rearrange(x, 'b (h w) c -> b c h w', h=hh, w=hh)  # (B,C,hh,hh)
+        qkv_c = self.qkv_dwconv_C(self.qkv_C(x_s))
+        q_c, k_c, v_c = qkv_c.chunk(3, dim=1)
+        q_c = rearrange(q_c, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k_c = rearrange(k_c, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v_c = rearrange(v_c, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+
+        q_c = F.normalize(q_c, dim=-1)
+        k_c = F.normalize(k_c, dim=-1)
+
+        attn_c = (q_c @ k_c.transpose(-2, -1)) * self.temperature + realPos  # 广播到 (B,H,CpH,CpH)
+        attn_c = attn_c.softmax(dim=-1)
+
+        x2 = (attn_c @ v_c)  # (B,H,CpH,(hh*hh))
+        x2 = rearrange(x2, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=hh, w=hh)
+        x2 = self.proj_C(x2)  # (B,C,hh,hh)
+        x2 = rearrange(x2, 'b c h w -> b (h w) c', h=hh, w=hh)  # (B,N,C)
+
+        # -------- 体素式融合（空间权重）--------
+        # (!!!) 关键约束: N 必须等于 64 才能让 reshape(Bsa, N, 1) 工作
+        attn_spatial = self.Gao_spatial_attention(attn)  # (B,64,1,1)
+        Bsa, _, _, _ = attn_spatial.shape
+        attn_spatial = attn_spatial.reshape(Bsa, N, 1)  # (B, N, 1)
+        x4 = attn_spatial * x2
+
+        out = x1 + x2 + x4
+        return out
+
+    def extra_repr(self) -> str:
+        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
+
+
+# ----------------------------------------------------------------------
+# (!!! 新增 !!!) 2. 窗口化/逆窗口化 辅助函数
+# ----------------------------------------------------------------------
+def window_partition(x, window_size):
+    """
+    将 (B, C, H, W) 划分为 (B*num_windows, N, C)，N=window_size*window_size
+    使用 einops.rearrange
+    """
+    B, C, H, W = x.shape
+    wh, ww = window_size
+    assert H % wh == 0 and W % ww == 0, "H, W 必须能被 window_size 整除"
+    # 1. (B, C, H, W) -> (B, C, h, wh, w, ww)  (h=H/wh, w=W/ww)
+    # 2. -> (B, h, w, wh, ww, C)  (permute)
+    # 3. -> (B*h*w, wh*ww, C)      (reshape)
+    x = rearrange(x, 'b c (h p1) (w p2) -> (b h w) (p1 p2) c', p1=wh, p2=ww)
+    return x
+
+
+def window_reverse(windows, window_size, H, W, B):
+    """
+    将 (B*num_windows, N, C) 逆转为 (B, C, H, W)
+    使用 einops.rearrange
+    """
+    wh, ww = window_size
+    h, w = H // wh, W // ww  # num_windows_h, num_windows_w
+    # 1. (B*h*w, wh*ww, C) -> (B, h, w, wh, ww, C)
+    # 2. -> (B, C, h, wh, w, ww) (permute)
+    # 3. -> (B, C, H, W)       (reshape)
+    x = rearrange(windows, '(b h w) (p1 p2) c -> b c (h p1) (w p2)', h=h, w=w, p1=wh, p2=ww, b=B)
+    return x
+
+
+# ----------------------------------------------------------------------
+# 3. 基础卷积块 (不变)
 # ----------------------------------------------------------------------
 class SingleConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, pad=1, dilation=1):
@@ -157,7 +354,7 @@ class SingleConv(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 2. 编码器 (下采样) 模块 (不变)
+# 4. 编码器 (下采样) 模块 (不变)
 # ----------------------------------------------------------------------
 class Encoder(nn.Module):
     def __init__(self, in_channels, stage_channels, num_blocks, ks, pad, dilation):
@@ -188,7 +385,7 @@ class Encoder(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 3. 跳跃连接处理模块 (不变)
+# 5. 跳跃连接处理模块 (不变)
 # ----------------------------------------------------------------------
 class SkipConnections(nn.Module):
     def __init__(self, stage_channels, short_rate):
@@ -208,28 +405,67 @@ class SkipConnections(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 4. 瓶颈层 (Bottleneck) 模块 (不变)
+# 6. 瓶颈层 (Bottleneck) 模块 (!!! 已修改为 VolSelfAttention !!!)
 # ----------------------------------------------------------------------
 class Bottleneck(nn.Module):
-    def __init__(self, in_channels, mid_channels, num_blocks, ks, pad, dilation):
+    """
+    使用 VolSelfAttention 重写的瓶颈层
+    """
+
+    def __init__(self, in_channels, mid_channels, num_blocks, ks, pad, dilation, num_heads):
         super().__init__()
-        layers = []
-        layers.append(SingleConv(in_channels, mid_channels, ks, pad, dilation))
-        for _ in range(num_blocks - 1):
-            layers.append(SingleConv(mid_channels, mid_channels, ks, pad, dilation))
-        self.bottleneck_convs = nn.Sequential(*layers)
+
+        # 1. 使用 1x1 卷积将输入通道 (in_channels) 调整为注意力模块的通道 (mid_channels)
+        #    我们复用 SingleConv (Conv+BN+ReLU)
+        self.pre_conv = SingleConv(in_channels, mid_channels, 1, 0, 1)
+
+        # 2. 定义窗口大小 (!!! 硬编码为 (8, 8) 以匹配 N=64 的约束 !!!)
+        self.window_size = (8, 8)
+
+        # 3. 实例化 VolSelfAttention
+        #    注意：dim 必须是 mid_channels
+        self.attn_block = VolSelfAttention(
+            dim=mid_channels,
+            window_size=self.window_size,
+            num_heads=num_heads
+        )
+
+        # (原有的 convs 循环被移除了, num_blocks, ks, pad, dilation 不再在此处使用)
 
     def forward(self, x):
-        return self.bottleneck_convs(x)
+        # 1. 调整通道
+        # x_in: (B, 16, 16, 16) -> (B, 8, 16, 16) [假设 mid_channels=8]
+        x = self.pre_conv(x)
+
+        B, C, H, W = x.shape
+
+        # 检查特征图尺寸是否可以被窗口整除
+        assert H % self.window_size[0] == 0 and W % self.window_size[1] == 0, \
+            f"特征图尺寸 ({H}, {W}) 无法被 window_size ({self.window_size}) 整除"
+
+        # 2. 窗口化: (B, C, H, W) -> (B*num_win, N, C)
+        # (B, 8, 16, 16) -> (B*4, 64, 8)
+        x_windows = window_partition(x, self.window_size)
+
+        # 3. 应用注意力
+        # (B*4, 64, 8) -> (B*4, 64, 8)
+        attn_windows = self.attn_block(x_windows)
+
+        # 4. 逆窗口化: (B*num_win, N, C) -> (B, C, H, W)
+        # (B*4, 64, 8) -> (B, 8, 16, 16)
+        x_out = window_reverse(attn_windows, self.window_size, H, W, B)
+
+        return x_out
 
 
 # ----------------------------------------------------------------------
-# 5. 解码器 (上采样) 模块 (!!! 已修改 !!!)
+# 7. 解码器 (上采样) 模块 (不变, 依赖于 Converse2D)
 # ----------------------------------------------------------------------
 class Decoder(nn.Module):
     """
     U-Net的解码器（上采样）路径。
     使用 Converse2D 作为上采样层。
+    ... (代码与您提供的一致，此处折叠) ...
     """
 
     def __init__(self, stage_channels, num_blocks, short_rate, ks, pad, dilation):
@@ -319,11 +555,13 @@ class Decoder(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 6. 重构后的 SimpleUNet (主模块) (不变)
+# 8. 重构后的 SimpleUNet (主模块) (!!! 已修改 !!!)
 # ----------------------------------------------------------------------
 class SimpleUNet(nn.Module):
     def __init__(self, in_channels, num_cls, ks=3, dilation=1, stage_channels=5 * [32], num_blocks=5 * [1],
-                 short_rate=0.5):
+                 short_rate=0.5,
+                 num_heads=8  # (!!! 新增参数 !!!)
+                 ):
         super(SimpleUNet, self).__init__()
         assert short_rate > 0, 'short_rate must be greater than 0!'
         assert len(stage_channels) == len(num_blocks), 'The length of stage_channels and num_blocks must match!'
@@ -332,17 +570,19 @@ class SimpleUNet(nn.Module):
 
         self.encoder = Encoder(in_channels, stage_channels, num_blocks, ks, self.pad, dilation)
         self.skip_connections = SkipConnections(stage_channels, short_rate)
+
+        # (!!! 已修改 !!!)
+        # 将 num_heads 传递给 Bottleneck
         self.bottleneck = Bottleneck(
             in_channels=stage_channels[-1],
             mid_channels=int(short_rate * stage_channels[-1]),
             num_blocks=num_blocks[-1],
             ks=ks,
             pad=self.pad,
-            dilation=dilation
+            dilation=dilation,
+            num_heads=num_heads  # (!!! 传入 !!!)
         )
-        # (!!! 注意 !!!)
-        # Decoder 的初始化调用不变，
-        # 因为 ks 和 pad 已经通过参数传递进去了
+
         self.decoder = Decoder(stage_channels, num_blocks, short_rate, ks, self.pad, dilation)
         self.seg_head = SingleConv(int(short_rate * stage_channels[0]), num_cls, 1, 0, 1)
 
@@ -356,27 +596,29 @@ class SimpleUNet(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 7. 测试代码 (不变)
+# 9. 测试代码 (!!! 已修改 !!!)
 # ----------------------------------------------------------------------
 if __name__ == '__main__':
     # 确保有可用的CUDA设备
     if torch.cuda.is_available():
         input = torch.randn(1, 3, 256, 256).cuda()
 
-        # 使用的参数 (ks=3, pad=1)
+        # (!!! 已修改 !!!)
+        # 传入 num_heads=8
         model = SimpleUNet(
             in_channels=3,
             num_cls=1,
-            ks=3,  # (!!!) 将被传递给 Converse2D
+            ks=3,
             stage_channels=[16, 16, 16, 16, 16],
             num_blocks=[1, 1, 1, 1, 1],
-            short_rate=0.5
+            short_rate=0.5,
+            num_heads=8  # (!!!) 传入注意力头数
         ).cuda()
 
         flops, params = profile(model, inputs=(input,))
         output = model(input)
 
-        print(f"\n--- Final Model Output (with Converse2D) ---")
+        print(f"\n--- Final Model Output (with Converse2D and VolSelfAttention) ---")
         print(f"Input shape: {input.shape}")
         print(f"Output shape: {output.shape}")
         print(f"FLOPs (G): {flops / 1e9}")
