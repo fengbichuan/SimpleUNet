@@ -3,9 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from thop import profile
 
+from ACA import AdaptiveCoordAtt
+
 
 # ----------------------------------------------------------------------
-# 0A. 您提供的 Converse2D 模块 (不变)
+# 0. 您提供的 Converse2D 模块 (粘贴在此处以便 Decoder 调用)
 # ----------------------------------------------------------------------
 class Converse2D(nn.Module):
     """
@@ -141,56 +143,6 @@ class Converse2D(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 0B. (!!! 新增 !!!) 您提供的 DynamicSpatialAttention 模块
-# ----------------------------------------------------------------------
-class DynamicSpatialAttention(nn.Module):
-    """
-    Dynamic Spatial Attention (DSA)
-    - 思路：为每个样本生成一个专属的 2D 卷积核（由全局通道描述生成），
-      用该核去卷积通道平均图，得到单通道空间注意力图，再对输入逐像素加权。
-    """
-
-    def __init__(self, in_channels: int, kernel_size: int = 3):
-        super().__init__()
-        assert kernel_size % 2 == 1, "kernel_size must be odd for symmetric padding"
-        self.kernel_size = kernel_size
-
-        # 共享的核生成器：先提全局通道描述（GAP），再两层 1×1 生成 k*k 个权重
-        self.kernel_generator = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),  # (B, C, 1, 1)
-            nn.Conv2d(in_channels, in_channels, 1),  # (B, C, 1, 1)
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels, kernel_size ** 2, 1)  # (B, k*k, 1, 1)
-        )
-        self.act = nn.Sigmoid()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.shape
-
-        # 1) 生成每个样本的动态卷积核  (B, k*k, 1, 1) -> (B, 1, k, k)
-        kernels = self.kernel_generator(x).view(B, 1, self.kernel_size, self.kernel_size)
-
-        # 2) 对输入在通道维求平均，得到单通道图 (B, 1, H, W)
-        x_mean = x.mean(dim=1, keepdim=True)
-
-        # 3) 重排为 grouped conv 的输入格式
-        #    输入:  (1, B, H, W), 卷积核: (B, 1, k, k), groups=B  => 每个样本仅与自己的核卷积
-        x_mean_group = x_mean.view(1, B, H, W)
-
-        # 4) 进行样本级动态卷积，得到注意力响应 (1, B, H, W) -> (B, 1, H, W)
-        att = F.conv2d(
-            x_mean_group,
-            weight=kernels,
-            padding=self.kernel_size // 2,
-            groups=B
-        ).view(B, 1, H, W)
-
-        # 5) Sigmoid 归一化并施加到原特征
-        att = self.act(att)
-        return x * att
-
-
-# ----------------------------------------------------------------------
 # 1. 基础卷积块 (不变)
 # ----------------------------------------------------------------------
 class SingleConv(nn.Module):
@@ -228,8 +180,6 @@ class Encoder(nn.Module):
         shortcuts = []
         x = self.en_layer0(x)
         shortcuts.append(x)
-        # 注意：Encoder 的 shortcuts 列表包含 (depth-1) 个元素
-        # 分别来自 stage_channels[0] 到 stage_channels[depth-2]
         for i in range(self.depth - 2):
             x = self.down(x)
             x = self.en_layers[i](x)
@@ -240,26 +190,40 @@ class Encoder(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 3. 跳跃连接处理模块 (不变)
+# 3. 跳跃连接处理模块 (!!! 应用策略一 !!!)
 # ----------------------------------------------------------------------
 class SkipConnections(nn.Module):
     def __init__(self, stage_channels, short_rate):
         super().__init__()
         self.depth = len(stage_channels)
         self.short_layers = nn.ModuleList()
-        # 创建 (depth-1) 个 1x1 卷积
+
+        # 导入您提供的注意力模块
+        # (确保 AdaptiveCoordAtt 类定义在 VAE.py 文件顶部或已被导入)
+
         for i in range(self.depth - 1):
-            layer = SingleConv(stage_channels[i], int(short_rate * stage_channels[i]), 1, 0, 1)
+            # (!!! 修改点 !!!)
+
+            in_ch = stage_channels[i]
+            out_ch = int(short_rate * stage_channels[i])
+
+            # 原来的:
+            # layer = SingleConv(in_ch, out_ch, 1, 0, 1)
+
+            # 现在的:
+            layer = nn.Sequential(
+                SingleConv(in_ch, out_ch, 1, 0, 1),
+                AdaptiveCoordAtt(in_channels=out_ch, reduction=16)  # 在1x1卷积后添加注意力
+            )
             self.short_layers.append(layer)
 
     def forward(self, shortcuts):
+        # forward 函数不需要任何改动
         refined_shortcuts = []
         for i in range(len(shortcuts)):
             refined = self.short_layers[i](shortcuts[i])
             refined_shortcuts.append(refined)
         return refined_shortcuts
-
-
 # ----------------------------------------------------------------------
 # 4. 瓶颈层 (Bottleneck) 模块 (不变)
 # ----------------------------------------------------------------------
@@ -283,66 +247,61 @@ class Decoder(nn.Module):
     """
     U-Net的解码器（上采样）路径。
     使用 Converse2D 作为上采样层。
-    (!!! 修改 !!!) 使用 DynamicSpatialAttention (DSA) 过滤跳跃连接。
     """
 
     def __init__(self, stage_channels, num_blocks, short_rate, ks, pad, dilation):
         super().__init__()
 
+        # 移除了 self.up = nn.Upsample(...)
+
         self.depth = len(stage_channels)
         re_stage_channels = stage_channels[::-1]
         re_num_blocks = num_blocks[::-1]
 
-        # 1. 解码器卷积层 (de_layer0, de_layer1, ...)
+        # 1. 解码器层 (de_layer0, de_layer1, ...)
         self.de_layers = nn.ModuleList()
 
-        # 2. Converse2D 上采样层
+        # (!!! 新增 !!!)
+        # 2. 创建 (depth-1) 个 Converse2D 上采样层
+        # 每一层的通道数 C 必须与 x (来自上一层解码器或瓶颈层) 的通道数匹配
+        # 因为 Converse2D 要求 in_channels == out_channels
         self.up_layers = nn.ModuleList()
 
-        # (!!! 新增 !!!)
-        # 3. DSA 模块层，用于过滤跳跃连接
-        self.dsa_skip_layers = nn.ModuleList()
-
-        # 计算上采样层的输入通道 (来自上一层解码器或瓶颈层)
+        # 计算解码器路径中，输入到 *上采样层* 的特征图通道数
+        # up_channels[0] = 瓶颈层输出通道数
+        # up_channels[1] = 第1个解码块输出通道数
+        # ...
         up_channels = [int(short_rate * ch) for ch in re_stage_channels]
 
-        # 计算跳跃连接的通道 (来自 SkipConnections 模块)
-        # re_stage_channels = [sc[4], sc[3], sc[2], sc[1], sc[0]]
-        # 我们需要的 skip 通道是 [sc[3]*r, sc[2]*r, sc[1]*r, sc[0]*r]
-        # 对应 re_stage_channels[i+1] * short_rate
-        skip_channels = [int(short_rate * re_stage_channels[i + 1]) for i in range(self.depth - 1)]
+        for i in range(self.depth - 1):  # 循环 (depth-1) 次, 创建 (depth-1) 个上采样层
 
-        for i in range(self.depth - 1):  # 循环 (depth-1) 次
-
-            # (!!! A. 添加 Converse2D 上采样层 !!!)
+            # (!!! 新增 !!!)
+            # 添加 Converse2D 上采样层
+            # 通道数 C = up_channels[i]
+            # 我们使用与解码器卷积相同的 ks 和 pad
             current_up_channels = up_channels[i]
             self.up_layers.append(
                 Converse2D(
                     in_channels=current_up_channels,
                     out_channels=current_up_channels,
-                    kernel_size=ks,
-                    scale=2,
-                    padding=pad,
-                    padding_mode="circular"
+                    kernel_size=ks,  # 复用传入的 ks
+                    scale=2,  # U-Net 固定的2倍上采样
+                    padding=pad,  # 复用传入的 pad
+                    padding_mode="circular"  # 沿用 Converse2D 示例中的模式
                 )
             )
 
-            # (!!! B. 新增：添加 DSA 注意力层 !!!)
-            # DSA 的 in_channels 必须匹配跳跃连接的通道数
-            current_skip_channels = skip_channels[i]
-            self.dsa_skip_layers.append(
-                DynamicSpatialAttention(
-                    in_channels=current_skip_channels,
-                    kernel_size=ks  # 复用 ks=3
-                )
-            )
-
-            # (!!! C. 添加解码器卷积块 !!!)
+            # (!!! 原有逻辑: 创建解码器卷积块 !!!)
+            # 注意：i 在这里是从 0 开始的 (因为 range(self.depth - 1))
+            # 但 re_stage_channels 和 re_num_blocks 的索引需要匹配原始逻辑 (从 1 开始)
+            # 因此我们使用 i+1 作为 re_... 的索引, i 作为 up_channels 的索引
             de_layers_block = []
 
-            # 拼接后的输入通道 = (来自上采样的) + (来自跳跃连接的)
-            in_ch_concat = current_up_channels + current_skip_channels
-            out_ch = int(short_rate * re_stage_channels[i + 1])  # 即 up_channels[i+1]
+            # 拼接后的输入通道计算保持不变
+            # [i]   -> re_stage_channels[i]   (上一层解码器的输出, 即 up_channels[i])
+            # [i+1] -> re_stage_channels[i+1] (来自SkipConnection)
+            in_ch_concat = up_channels[i] + int(short_rate * re_stage_channels[i + 1])
+            out_ch = int(short_rate * re_stage_channels[i + 1])  # (即 up_channels[i+1])
 
             de_layers_block.append(SingleConv(in_ch_concat, out_ch, ks, pad, dilation))
 
@@ -353,7 +312,6 @@ class Decoder(nn.Module):
 
     def forward(self, x_from_bottleneck, refined_shortcuts):
         # 将跳跃连接反转，以便从深到浅使用
-        # 对应通道: [skip_channels[0], skip_channels[1], ...]
         re_shortcuts = refined_shortcuts[::-1]
 
         x = x_from_bottleneck  # 从瓶颈层的输出开始
@@ -361,19 +319,15 @@ class Decoder(nn.Module):
         # 循环上采样
         for j in range(self.depth - 1):  # 循环 (depth-1) 次
 
+            # (!!! 已修改 !!!)
             # 1. 使用 Converse2D 进行上采样
             x_up = self.up_layers[j](x)
 
             # 2. 获取对应的跳跃连接
             shortcut = re_shortcuts[j]
 
-            # (!!! 新增 !!!)
-            # 2.5 使用 DSA 模块“过滤”跳跃连接
-            shortcut_attended = self.dsa_skip_layers[j](shortcut)
-
-            # (!!! 修改 !!!)
-            # 3. 标准U-Net融合：拼接 (使用过滤后的 shortcut)
-            y = torch.concat([shortcut_attended, x_up], dim=1)
+            # 3. 标准U-Net融合：直接拼接
+            y = torch.concat([shortcut, x_up], dim=1)
 
             # 4. 通过解码器卷积块
             x = self.de_layers[j](y)
@@ -403,7 +357,9 @@ class SimpleUNet(nn.Module):
             pad=self.pad,
             dilation=dilation
         )
-        # Decoder 的初始化调用不变
+        # (!!! 注意 !!!)
+        # Decoder 的初始化调用不变，
+        # 因为 ks 和 pad 已经通过参数传递进去了
         self.decoder = Decoder(stage_channels, num_blocks, short_rate, ks, self.pad, dilation)
         self.seg_head = SingleConv(int(short_rate * stage_channels[0]), num_cls, 1, 0, 1)
 
@@ -428,7 +384,7 @@ if __name__ == '__main__':
         model = SimpleUNet(
             in_channels=3,
             num_cls=1,
-            ks=3,  # (!!!) 将被传递给 Converse2D 和 DynamicSpatialAttention
+            ks=3,  # (!!!) 将被传递给 Converse2D
             stage_channels=[16, 16, 16, 16, 16],
             num_blocks=[1, 1, 1, 1, 1],
             short_rate=0.5
@@ -437,7 +393,7 @@ if __name__ == '__main__':
         flops, params = profile(model, inputs=(input,))
         output = model(input)
 
-        print(f"\n--- Final Model Output (with Converse2D + DSA on Skips) ---")
+        print(f"\n--- Final Model Output (with Converse2D) ---")
         print(f"Input shape: {input.shape}")
         print(f"Output shape: {output.shape}")
         print(f"FLOPs (G): {flops / 1e9}")
