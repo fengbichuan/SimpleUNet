@@ -13,7 +13,7 @@ from metrics import calculate_metrics_and_loss
 # 数据路径
 DATA_PATH = r"D:\对照试验模型\dataset\9-isic2018"
 # 模型权重路径
-MODEL_PATH = "Wavelet-isic-2018-[16,16,16,16,16]-BCE-test1"
+MODEL_PATH = ".\Experience-isic2018\VSA+Converse2D[64,128,256,512,1024]"
 
 # 设备
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
