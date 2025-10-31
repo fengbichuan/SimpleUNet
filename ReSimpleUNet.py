@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from thop import profile
 
-from ACA import AdaptiveCoordAtt
+from SPRSA import SPR_SA
 
 
 # ----------------------------------------------------------------------
@@ -190,42 +190,27 @@ class Encoder(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 3. 跳跃连接处理模块 (!!! 应用策略一 !!!)
+# 3. 跳跃连接处理模块 (不变)
 # ----------------------------------------------------------------------
 class SkipConnections(nn.Module):
     def __init__(self, stage_channels, short_rate):
         super().__init__()
         self.depth = len(stage_channels)
         self.short_layers = nn.ModuleList()
-
-        # 导入您提供的注意力模块
-        # (确保 AdaptiveCoordAtt 类定义在 VAE.py 文件顶部或已被导入)
-
         for i in range(self.depth - 1):
-            # (!!! 修改点 !!!)
-
-            in_ch = stage_channels[i]
-            out_ch = int(short_rate * stage_channels[i])
-
-            # 原来的:
-            # layer = SingleConv(in_ch, out_ch, 1, 0, 1)
-
-            # 现在的:
-            layer = nn.Sequential(
-                SingleConv(in_ch, out_ch, 1, 0, 1),
-                AdaptiveCoordAtt(in_channels=out_ch, reduction=16)  # 在1x1卷积后添加注意力
-            )
+            layer = SingleConv(stage_channels[i], int(short_rate * stage_channels[i]), 1, 0, 1)
             self.short_layers.append(layer)
 
     def forward(self, shortcuts):
-        # forward 函数不需要任何改动
         refined_shortcuts = []
         for i in range(len(shortcuts)):
             refined = self.short_layers[i](shortcuts[i])
             refined_shortcuts.append(refined)
         return refined_shortcuts
+
+
 # ----------------------------------------------------------------------
-# 4. 瓶颈层 (Bottleneck) 模块 (不变)
+# 4. 瓶颈层 (Bottleneck) 模块 (!!! 方案 A 修改 !!!)
 # ----------------------------------------------------------------------
 class Bottleneck(nn.Module):
     def __init__(self, in_channels, mid_channels, num_blocks, ks, pad, dilation):
@@ -236,8 +221,18 @@ class Bottleneck(nn.Module):
             layers.append(SingleConv(mid_channels, mid_channels, ks, pad, dilation))
         self.bottleneck_convs = nn.Sequential(*layers)
 
+        # --- 新增 ---
+        # 在卷积块之后，添加 SPR_SA 模块
+        # 注意: 它的 dim 应该等于它所接收的特征图通道数，即 mid_channels
+        self.attention = SPR_SA(dim=mid_channels)
+        # -----------
+
     def forward(self, x):
-        return self.bottleneck_convs(x)
+        x = self.bottleneck_convs(x)
+        # --- 新增 ---
+        x = self.attention(x)  # 应用注意力
+        # -----------
+        return x
 
 
 # ----------------------------------------------------------------------
