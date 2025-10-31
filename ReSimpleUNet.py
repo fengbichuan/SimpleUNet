@@ -3,11 +3,95 @@ import torch.nn as nn
 import torch.nn.functional as F
 from thop import profile
 
-from SPRSA import SPR_SA
+
+# ----------------------------------------------------------------------
+# 0. A) GLCA 模块 (已按方案2修改)
+# ----------------------------------------------------------------------
+class LocalChannelAttention(nn.Module):
+    """
+    局部通道注意力（逐通道一维卷积平滑）
+    - GAP 将 (H,W) 聚合到通道向量，再用 1D Conv 提取局部关系，Sigmoid 得到通道权重；
+    - 输出为残差形式：y = x * att + x。
+    Inputs : x ∈ (B, C, H, W)
+    Outputs: y ∈ (B, C, H, W)
+    """
+
+    def __init__(self, kernel_size: int):  # (!!! MODIFIED: 移除了 feature_map_size)
+        super().__init__()
+        assert kernel_size % 2 == 1, "kernel_size 必须是奇数"
+        self.conv = nn.Conv1d(1, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2)
+
+        # (!!! MODIFIED: 使用自适应池化，使其与分辨率无关)
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        n, c, h, w = x.shape
+        # self.gap(x) 现在总是 (B, C, 1, 1)
+        att = self.gap(x).reshape(n, 1, c)  # (B,1,C)
+        att = self.conv(att).sigmoid()  # (B,1,C)
+        att = att.reshape(n, c, 1, 1)  # (B,C,1,1)
+        return x * att + x
+
+
+class GlobalChannelAttention(nn.Module):
+    """
+    全局通道注意力（通道间相关性）
+    - 对 GAP 后的通道向量做 Query/Key 平滑，再计算通道-通道相关性得到 (C×C) 权重；
+    - 用 value=像素×通道 展开，与 (C×C) 相乘回到通道注意。
+    """
+
+    def __init__(self, kernel_size: int):  # (!!! MODIFIED: 移除了 feature_map_size)
+        super().__init__()
+        assert kernel_size % 2 == 1, "kernel_size 必须是奇数"
+        self.conv_q = nn.Conv1d(1, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2)
+        self.conv_k = nn.Conv1d(1, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2)
+
+        # (!!! MODIFIED: 使用自适应池化)
+        self.gap = nn.AdaptiveAvgPool2d((1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        n, c, h, w = x.shape
+        # self.gap(x) 现在总是 (B, C, 1, 1)
+        q = k = self.gap(x).reshape(n, 1, c)  # (B,1,C)
+        q = self.conv_q(q).sigmoid()  # (B,1,C)
+        k = self.conv_k(k).sigmoid().permute(0, 2, 1)  # (B,C,1)
+
+        qk = torch.bmm(k, q).reshape(n, -1)  # (B,C)
+        qk = qk.softmax(-1).reshape(n, c, c)  # (B,C,C)
+
+        v = x.permute(0, 2, 3, 1).reshape(n, -1, c)  # (B,HW,C)
+        att = torch.bmm(v, qk).permute(0, 2, 1)  # (B,C,HW)
+        att = att.reshape(n, c, h, w)  # (B,C,H,W)
+        return x * att
+
+
+class GLCA(nn.Module):
+    """
+    Global-Local Channel Attention
+    - 将通道一分为二：前半做全局通道注意力，后半做局部通道注意力；
+    - 拼接后与输入做残差。
+    """
+
+    def __init__(self, kernel_size: int):  # (!!! MODIFIED: 移除了 feature_map_size)
+        super().__init__()
+        assert kernel_size % 2 == 1, "kernel_size 必须是奇数"
+        # (!!! MODIFIED: 实例化时不再传入 feature_map_size)
+        self.global_attention = GlobalChannelAttention(kernel_size)
+        self.local_attention = LocalChannelAttention(kernel_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (!!! MODIFIED: 在 forward 中添加动态检查)
+        assert x.shape[1] % 2 == 0, f"GLCA 需要偶数通道, 但得到 {x.shape[1]}"
+
+        left, right = x.chunk(2, dim=1)  # 各 (B,C/2,H,W)
+        x1 = self.global_attention(left)
+        x2 = self.local_attention(right)
+        out = torch.cat((x1, x2), dim=1)  # (B,C,H,W)
+        return out + x
 
 
 # ----------------------------------------------------------------------
-# 0. 您提供的 Converse2D 模块 (粘贴在此处以便 Decoder 调用)
+# 0. B) 您提供的 Converse2D 模块 (粘贴在此处以便 Decoder 调用)
 # ----------------------------------------------------------------------
 class Converse2D(nn.Module):
     """
@@ -210,7 +294,7 @@ class SkipConnections(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 4. 瓶颈层 (Bottleneck) 模块 (!!! 方案 A 修改 !!!)
+# 4. 瓶颈层 (Bottleneck) 模块 (!!! MODIFIED: 已集成 GLCA !!!)
 # ----------------------------------------------------------------------
 class Bottleneck(nn.Module):
     def __init__(self, in_channels, mid_channels, num_blocks, ks, pad, dilation):
@@ -221,22 +305,20 @@ class Bottleneck(nn.Module):
             layers.append(SingleConv(mid_channels, mid_channels, ks, pad, dilation))
         self.bottleneck_convs = nn.Sequential(*layers)
 
-        # --- 新增 ---
-        # 在卷积块之后，添加 SPR_SA 模块
-        # 注意: 它的 dim 应该等于它所接收的特征图通道数，即 mid_channels
-        self.attention = SPR_SA(dim=mid_channels)
-        # -----------
+        # (!!! MODIFIED: 在 Bottleneck 内部添加 GLCA !!!)
+        # 确保 GLCA 的输入通道 (mid_channels) 是偶数
+        assert mid_channels % 2 == 0, f"Bottleneck mid_channels {mid_channels} 必须为偶数才能用 GLCA"
+        self.glca = GLCA(kernel_size=ks)  # 复用 ks
 
     def forward(self, x):
-        x = self.bottleneck_convs(x)
-        # --- 新增 ---
-        x = self.attention(x)  # 应用注意力
-        # -----------
-        return x
+        x_conv = self.bottleneck_convs(x)
+        # (!!! MODIFIED: 在卷积后应用注意力)
+        x_att = self.glca(x_conv)
+        return x_att
 
 
 # ----------------------------------------------------------------------
-# 5. 解码器 (上采样) 模块 (!!! 已修改 !!!)
+# 5. 解码器 (上采样) 模块 (不变, 沿用 Converse2D 版本)
 # ----------------------------------------------------------------------
 class Decoder(nn.Module):
     """
@@ -247,87 +329,50 @@ class Decoder(nn.Module):
     def __init__(self, stage_channels, num_blocks, short_rate, ks, pad, dilation):
         super().__init__()
 
-        # 移除了 self.up = nn.Upsample(...)
-
         self.depth = len(stage_channels)
         re_stage_channels = stage_channels[::-1]
         re_num_blocks = num_blocks[::-1]
 
-        # 1. 解码器层 (de_layer0, de_layer1, ...)
         self.de_layers = nn.ModuleList()
-
-        # (!!! 新增 !!!)
-        # 2. 创建 (depth-1) 个 Converse2D 上采样层
-        # 每一层的通道数 C 必须与 x (来自上一层解码器或瓶颈层) 的通道数匹配
-        # 因为 Converse2D 要求 in_channels == out_channels
         self.up_layers = nn.ModuleList()
-
-        # 计算解码器路径中，输入到 *上采样层* 的特征图通道数
-        # up_channels[0] = 瓶颈层输出通道数
-        # up_channels[1] = 第1个解码块输出通道数
-        # ...
         up_channels = [int(short_rate * ch) for ch in re_stage_channels]
 
         for i in range(self.depth - 1):  # 循环 (depth-1) 次, 创建 (depth-1) 个上采样层
 
-            # (!!! 新增 !!!)
-            # 添加 Converse2D 上采样层
-            # 通道数 C = up_channels[i]
-            # 我们使用与解码器卷积相同的 ks 和 pad
             current_up_channels = up_channels[i]
             self.up_layers.append(
                 Converse2D(
                     in_channels=current_up_channels,
                     out_channels=current_up_channels,
-                    kernel_size=ks,  # 复用传入的 ks
-                    scale=2,  # U-Net 固定的2倍上采样
-                    padding=pad,  # 复用传入的 pad
-                    padding_mode="circular"  # 沿用 Converse2D 示例中的模式
+                    kernel_size=ks,
+                    scale=2,
+                    padding=pad,
+                    padding_mode="circular"
                 )
             )
 
-            # (!!! 原有逻辑: 创建解码器卷积块 !!!)
-            # 注意：i 在这里是从 0 开始的 (因为 range(self.depth - 1))
-            # 但 re_stage_channels 和 re_num_blocks 的索引需要匹配原始逻辑 (从 1 开始)
-            # 因此我们使用 i+1 作为 re_... 的索引, i 作为 up_channels 的索引
             de_layers_block = []
-
-            # 拼接后的输入通道计算保持不变
-            # [i]   -> re_stage_channels[i]   (上一层解码器的输出, 即 up_channels[i])
-            # [i+1] -> re_stage_channels[i+1] (来自SkipConnection)
             in_ch_concat = up_channels[i] + int(short_rate * re_stage_channels[i + 1])
             out_ch = int(short_rate * re_stage_channels[i + 1])  # (即 up_channels[i+1])
 
             de_layers_block.append(SingleConv(in_ch_concat, out_ch, ks, pad, dilation))
 
-            for _ in range(re_num_blocks[i + 1] - 1):  # 使用 re_num_blocks[i+1]
+            for _ in range(re_num_blocks[i + 1] - 1):
                 de_layers_block.append(SingleConv(out_ch, out_ch, ks, pad, dilation))
 
             self.de_layers.append(nn.Sequential(*de_layers_block))
 
     def forward(self, x_from_bottleneck, refined_shortcuts):
-        # 将跳跃连接反转，以便从深到浅使用
         re_shortcuts = refined_shortcuts[::-1]
+        x = x_from_bottleneck
 
-        x = x_from_bottleneck  # 从瓶颈层的输出开始
-
-        # 循环上采样
-        for j in range(self.depth - 1):  # 循环 (depth-1) 次
-
-            # (!!! 已修改 !!!)
-            # 1. 使用 Converse2D 进行上采样
+        for j in range(self.depth - 1):
             x_up = self.up_layers[j](x)
-
-            # 2. 获取对应的跳跃连接
             shortcut = re_shortcuts[j]
-
-            # 3. 标准U-Net融合：直接拼接
             y = torch.concat([shortcut, x_up], dim=1)
-
-            # 4. 通过解码器卷积块
             x = self.de_layers[j](y)
 
-        return x  # 返回解码器最后一层的输出
+        return x
 
 
 # ----------------------------------------------------------------------
@@ -344,6 +389,8 @@ class SimpleUNet(nn.Module):
 
         self.encoder = Encoder(in_channels, stage_channels, num_blocks, ks, self.pad, dilation)
         self.skip_connections = SkipConnections(stage_channels, short_rate)
+
+        # (!!! Bottleneck 实例化不变, 因为 GLCA 已被封装在 Bottleneck 内部)
         self.bottleneck = Bottleneck(
             in_channels=stage_channels[-1],
             mid_channels=int(short_rate * stage_channels[-1]),
@@ -352,16 +399,13 @@ class SimpleUNet(nn.Module):
             pad=self.pad,
             dilation=dilation
         )
-        # (!!! 注意 !!!)
-        # Decoder 的初始化调用不变，
-        # 因为 ks 和 pad 已经通过参数传递进去了
         self.decoder = Decoder(stage_channels, num_blocks, short_rate, ks, self.pad, dilation)
         self.seg_head = SingleConv(int(short_rate * stage_channels[0]), num_cls, 1, 0, 1)
 
     def forward(self, x):
         x_to_bottleneck, shortcuts = self.encoder(x)
         refined_shortcuts = self.skip_connections(shortcuts)
-        x_after_bottleneck = self.bottleneck(x_to_bottleneck)
+        x_after_bottleneck = self.bottleneck(x_to_bottleneck)  # (!!! GLCA 在这里被调用)
         x = self.decoder(x_after_bottleneck, refined_shortcuts)
         output = self.seg_head(x)
         return output
@@ -373,25 +417,35 @@ class SimpleUNet(nn.Module):
 if __name__ == '__main__':
     # 确保有可用的CUDA设备
     if torch.cuda.is_available():
-        input = torch.randn(1, 3, 256, 256).cuda()
+        input_tensor = torch.randn(1, 3, 256, 256).cuda()
 
-        # 使用的参数 (ks=3, pad=1)
+        # (!!! 实例化时无需传入 init_H, 保持原样)
         model = SimpleUNet(
             in_channels=3,
             num_cls=1,
-            ks=3,  # (!!!) 将被传递给 Converse2D
+            ks=3,
+            # (!!!) stage_channels[-1]=16, short_rate=0.5 -> mid_channels=8 (偶数)
+            # (!!!) 这样 Bottleneck 中的断言会通过
             stage_channels=[16, 16, 16, 16, 16],
             num_blocks=[1, 1, 1, 1, 1],
             short_rate=0.5
         ).cuda()
 
-        flops, params = profile(model, inputs=(input,))
-        output = model(input)
+        # 测试模型是否能处理不同尺寸的输入
+        input_tensor_512 = torch.randn(1, 3, 512, 512).cuda()
 
-        print(f"\n--- Final Model Output (with Converse2D) ---")
-        print(f"Input shape: {input.shape}")
-        print(f"Output shape: {output.shape}")
-        print(f"FLOPs (G): {flops / 1e9}")
+        flops, params = profile(model, inputs=(input_tensor,))
+        output = model(input_tensor)
+
+        with torch.no_grad():
+            output_512 = model(input_tensor_512)
+
+        print(f"\n--- Final Model Output (with Converse2D + GLCA @ Bottleneck) ---")
+        print(f"Input shape (256): {input_tensor.shape}")
+        print(f"Output shape (256): {output.shape}")
+        print(f"Input shape (512): {input_tensor_512.shape}")
+        print(f"Output shape (512): {output_512.shape}")
+        print(f"FLOPs (G) on 256x256: {flops / 1e9}")
         print(f"Params (M): {params / 1e6}")
     else:
         print("CUDA not available. Please run this on a machine with a GPU.")
