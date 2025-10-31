@@ -19,14 +19,14 @@ DATA_PATH = r"D:\对照试验模型\dataset\9-isic2018"
 # 超参数
 LEARNING_RATE = 0.0003
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 8
+BATCH_SIZE = 2
 NUM_EPOCHS = 300
-NUM_WORKERS = 0
+NUM_WORKERS = 4
 IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 256
 PIN_MEMORY = True
 NUM_CLASSES = 1  # <-- 修改点: 二分类 (BCE) 模式下, 输出通道为 1
-SAVE_PATH = "GLCA+Converse2D[64,128,256,512,1024]"  # <-- 修改点: 更改保存名称1
+SAVE_PATH = "HC+Converse2D[64,128,256,512,1024]"  # <-- 修改点: 更改保存名称1
 early_stop_patience = 20
 early_stop_counter = 0
 stage_channels = [64, 128, 256, 512, 1024]
