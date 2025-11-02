@@ -1,47 +1,13 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor
 from thop import profile
 
-
-# ----------------------------------------------------------------------
-# 0A. 您新增的 HalfConv 模块 (已添加)
-# ----------------------------------------------------------------------
-class HalfConv(nn.Module):
-    """
-    HalfConv
-    - 将通道按 1/n_div : (1-1/n_div) 划分，仅对前一部分做 3×3 卷积，剩余通道保持不变；
-    - 计算更省、保留部分原始特征。
-    Inputs : x ∈ (B, C, H, W)
-    Outputs: y ∈ (B, C, H, W)
-    """
-
-    def __init__(self, dim: int, n_div: int = 2):
-        super().__init__()
-        # (!!! 注意 !!!)
-        # 增加一个n_div=1的保险，此时它等同于一个标准Conv2d
-        if n_div == 1:
-            self.dim_conv3 = dim
-            self.dim_untouched = 0
-        else:
-            assert dim % n_div == 0, f"dim ({dim}) 必须能被 n_div ({n_div}) 整除"
-            self.dim_conv3 = dim // n_div
-            self.dim_untouched = dim - self.dim_conv3
-
-        self.partial_conv3 = nn.Conv2d(self.dim_conv3, self.dim_conv3, kernel_size=3, stride=1, padding=1, bias=False)
-
-    def forward(self, x: Tensor) -> Tensor:
-        if self.dim_untouched == 0:
-            return self.partial_conv3(x)
-
-        x1, x2 = torch.split(x, [self.dim_conv3, self.dim_untouched], dim=1)
-        x1 = self.partial_conv3(x1)
-        return torch.cat((x1, x2), dim=1)
+from FCM import FCM
 
 
 # ----------------------------------------------------------------------
-# 0B. 您提供的 Converse2D 模块 (不变)
+# 0. 您提供的 Converse2D 模块 (粘贴在此处以便 Decoder 调用)
 # ----------------------------------------------------------------------
 class Converse2D(nn.Module):
     """
@@ -177,31 +143,13 @@ class Converse2D(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 1. 基础卷积块 (!!! 已修改 !!!)
-#    - 添加 use_half_conv 参数
+# 1. 基础卷积块 (不变)
 # ----------------------------------------------------------------------
 class SingleConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, pad=1, dilation=1, use_half_conv=False, n_div=2):
+    def __init__(self, in_channels, out_channels, kernel_size=3, pad=1, dilation=1):
         super().__init__()
-
-        conv_layer = None
-
-        if use_half_conv:
-            # HalfConv 的约束条件
-            assert in_channels == out_channels, "HalfConv 要求 in_channels == out_channels"
-            assert kernel_size == 3, "HalfConv 仅支持 3x3 卷积"
-            assert dilation == 1, "HalfConv 不支持 dilation"
-            assert pad == 1, "HalfConv 内部 padding=1"
-
-            # 使用 HalfConv 替换标准 Conv2d
-            conv_layer = HalfConv(dim=in_channels, n_div=n_div)
-        else:
-            # 保持原始的标准卷积
-            conv_layer = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=pad, dilation=dilation,
-                                   bias=False)
-
         self.single_conv = nn.Sequential(
-            conv_layer,
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=pad, dilation=dilation, bias=False),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
@@ -211,8 +159,7 @@ class SingleConv(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 2. 编码器 (下采样) 模块 (!!! 已修改 !!!)
-#    - 在 C->C 卷积中启用 use_half_conv=True
+# 2. 编码器 (下采样) 模块 (不变)
 # ----------------------------------------------------------------------
 class Encoder(nn.Module):
     def __init__(self, in_channels, stage_channels, num_blocks, ks, pad, dilation):
@@ -220,20 +167,13 @@ class Encoder(nn.Module):
         self.depth = len(stage_channels)
         self.down = nn.MaxPool2d(2)
 
-        # C_in -> C_0 (通道变化, 不使用 HalfConv)
-        self.en_layer0 = SingleConv(in_channels, stage_channels[0], ks, pad, dilation, use_half_conv=False)
-
+        self.en_layer0 = SingleConv(in_channels, stage_channels[0], ks, pad, dilation)
         self.en_layers = nn.ModuleList()
         for i in range(1, self.depth):
             layers = []
-
-            # C_i-1 -> C_i-1 (通道不变, 使用 HalfConv)
             for _ in range(num_blocks[i] - 1):
-                layers.append(
-                    SingleConv(stage_channels[i - 1], stage_channels[i - 1], ks, pad, dilation, use_half_conv=True))
-
-            # C_i-1 -> C_i (通道变化, 不使用 HalfConv)
-            layers.append(SingleConv(stage_channels[i - 1], stage_channels[i], ks, pad, dilation, use_half_conv=False))
+                layers.append(SingleConv(stage_channels[i - 1], stage_channels[i - 1], ks, pad, dilation))
+            layers.append(SingleConv(stage_channels[i - 1], stage_channels[i], ks, pad, dilation))
             self.en_layers.append(nn.Sequential(*layers))
 
     def forward(self, x):
@@ -249,42 +189,53 @@ class Encoder(nn.Module):
         return x, shortcuts
 
 
+# ... (需要先导入 FCM 类) ...
+
 # ----------------------------------------------------------------------
-# 3. 跳跃连接处理模块 (不变)
+# 3. 跳跃连接处理模块 (!!! 修改 !!!)
 # ----------------------------------------------------------------------
 class SkipConnections(nn.Module):
     def __init__(self, stage_channels, short_rate):
         super().__init__()
         self.depth = len(stage_channels)
         self.short_layers = nn.ModuleList()
+
+        # (!!! 新增 !!!)
+        self.fcm_layers = nn.ModuleList() # 为每一层 skip path 创建一个 FCM
+
         for i in range(self.depth - 1):
-            layer = SingleConv(stage_channels[i], int(short_rate * stage_channels[i]), 1, 0, 1)
+            # 1x1 卷积层 (不变)
+            out_ch = int(short_rate * stage_channels[i])
+            layer = SingleConv(stage_channels[i], out_ch, 1, 0, 1)
             self.short_layers.append(layer)
+
+            # (!!! 新增 !!!)
+            # 添加 FCM 模块，通道数与 1x1 卷积的输出匹配
+            self.fcm_layers.append(FCM(channels=out_ch))
 
     def forward(self, shortcuts):
         refined_shortcuts = []
         for i in range(len(shortcuts)):
+            # (!!! 修改 !!!)
+            # 1. 先通过 1x1 卷积调整通道
             refined = self.short_layers[i](shortcuts[i])
+            # 2. 再通过 FCM 进行精炼
+            refined = self.fcm_layers[i](refined)
+
             refined_shortcuts.append(refined)
         return refined_shortcuts
 
 
 # ----------------------------------------------------------------------
-# 4. 瓶颈层 (Bottleneck) 模块 (!!! 已修改 !!!)
-#    - 在 C->C 卷积中启用 use_half_conv=True
+# 4. 瓶颈层 (Bottleneck) 模块 (不变)
 # ----------------------------------------------------------------------
 class Bottleneck(nn.Module):
     def __init__(self, in_channels, mid_channels, num_blocks, ks, pad, dilation):
         super().__init__()
         layers = []
-
-        # C_in -> C_mid (通道变化, 不使用 HalfConv)
-        layers.append(SingleConv(in_channels, mid_channels, ks, pad, dilation, use_half_conv=False))
-
-        # C_mid -> C_mid (通道不变, 使用 HalfConv)
+        layers.append(SingleConv(in_channels, mid_channels, ks, pad, dilation))
         for _ in range(num_blocks - 1):
-            layers.append(SingleConv(mid_channels, mid_channels, ks, pad, dilation, use_half_conv=True))
-
+            layers.append(SingleConv(mid_channels, mid_channels, ks, pad, dilation))
         self.bottleneck_convs = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -293,7 +244,6 @@ class Bottleneck(nn.Module):
 
 # ----------------------------------------------------------------------
 # 5. 解码器 (上采样) 模块 (!!! 已修改 !!!)
-#    - 在 C->C 卷积中启用 use_half_conv=True
 # ----------------------------------------------------------------------
 class Decoder(nn.Module):
     """
@@ -304,56 +254,87 @@ class Decoder(nn.Module):
     def __init__(self, stage_channels, num_blocks, short_rate, ks, pad, dilation):
         super().__init__()
 
+        # 移除了 self.up = nn.Upsample(...)
+
         self.depth = len(stage_channels)
         re_stage_channels = stage_channels[::-1]
         re_num_blocks = num_blocks[::-1]
 
+        # 1. 解码器层 (de_layer0, de_layer1, ...)
         self.de_layers = nn.ModuleList()
+
+        # (!!! 新增 !!!)
+        # 2. 创建 (depth-1) 个 Converse2D 上采样层
+        # 每一层的通道数 C 必须与 x (来自上一层解码器或瓶颈层) 的通道数匹配
+        # 因为 Converse2D 要求 in_channels == out_channels
         self.up_layers = nn.ModuleList()
 
+        # 计算解码器路径中，输入到 *上采样层* 的特征图通道数
+        # up_channels[0] = 瓶颈层输出通道数
+        # up_channels[1] = 第1个解码块输出通道数
+        # ...
         up_channels = [int(short_rate * ch) for ch in re_stage_channels]
 
-        for i in range(self.depth - 1):  # 循环 (depth-1) 次
+        for i in range(self.depth - 1):  # 循环 (depth-1) 次, 创建 (depth-1) 个上采样层
 
-            # 1. 添加 Converse2D 上采样层
+            # (!!! 新增 !!!)
+            # 添加 Converse2D 上采样层
+            # 通道数 C = up_channels[i]
+            # 我们使用与解码器卷积相同的 ks 和 pad
             current_up_channels = up_channels[i]
             self.up_layers.append(
                 Converse2D(
                     in_channels=current_up_channels,
                     out_channels=current_up_channels,
-                    kernel_size=ks,
-                    scale=2,
-                    padding=pad,
-                    padding_mode="circular"
+                    kernel_size=ks,  # 复用传入的 ks
+                    scale=2,  # U-Net 固定的2倍上采样
+                    padding=pad,  # 复用传入的 pad
+                    padding_mode="circular"  # 沿用 Converse2D 示例中的模式
                 )
             )
 
-            # 2. 创建解码器卷积块
+            # (!!! 原有逻辑: 创建解码器卷积块 !!!)
+            # 注意：i 在这里是从 0 开始的 (因为 range(self.depth - 1))
+            # 但 re_stage_channels 和 re_num_blocks 的索引需要匹配原始逻辑 (从 1 开始)
+            # 因此我们使用 i+1 作为 re_... 的索引, i 作为 up_channels 的索引
             de_layers_block = []
 
+            # 拼接后的输入通道计算保持不变
+            # [i]   -> re_stage_channels[i]   (上一层解码器的输出, 即 up_channels[i])
+            # [i+1] -> re_stage_channels[i+1] (来自SkipConnection)
             in_ch_concat = up_channels[i] + int(short_rate * re_stage_channels[i + 1])
-            out_ch = int(short_rate * re_stage_channels[i + 1])
+            out_ch = int(short_rate * re_stage_channels[i + 1])  # (即 up_channels[i+1])
 
-            # C_concat -> C_out (通道变化, 不使用 HalfConv)
-            de_layers_block.append(SingleConv(in_ch_concat, out_ch, ks, pad, dilation, use_half_conv=False))
+            de_layers_block.append(SingleConv(in_ch_concat, out_ch, ks, pad, dilation))
 
-            # C_out -> C_out (通道不变, 使用 HalfConv)
-            for _ in range(re_num_blocks[i + 1] - 1):
-                de_layers_block.append(SingleConv(out_ch, out_ch, ks, pad, dilation, use_half_conv=True))
+            for _ in range(re_num_blocks[i + 1] - 1):  # 使用 re_num_blocks[i+1]
+                de_layers_block.append(SingleConv(out_ch, out_ch, ks, pad, dilation))
 
             self.de_layers.append(nn.Sequential(*de_layers_block))
 
     def forward(self, x_from_bottleneck, refined_shortcuts):
+        # 将跳跃连接反转，以便从深到浅使用
         re_shortcuts = refined_shortcuts[::-1]
-        x = x_from_bottleneck
 
-        for j in range(self.depth - 1):
+        x = x_from_bottleneck  # 从瓶颈层的输出开始
+
+        # 循环上采样
+        for j in range(self.depth - 1):  # 循环 (depth-1) 次
+
+            # (!!! 已修改 !!!)
+            # 1. 使用 Converse2D 进行上采样
             x_up = self.up_layers[j](x)
+
+            # 2. 获取对应的跳跃连接
             shortcut = re_shortcuts[j]
+
+            # 3. 标准U-Net融合：直接拼接
             y = torch.concat([shortcut, x_up], dim=1)
+
+            # 4. 通过解码器卷积块
             x = self.de_layers[j](y)
 
-        return x
+        return x  # 返回解码器最后一层的输出
 
 
 # ----------------------------------------------------------------------
@@ -378,6 +359,9 @@ class SimpleUNet(nn.Module):
             pad=self.pad,
             dilation=dilation
         )
+        # (!!! 注意 !!!)
+        # Decoder 的初始化调用不变，
+        # 因为 ks 和 pad 已经通过参数传递进去了
         self.decoder = Decoder(stage_channels, num_blocks, short_rate, ks, self.pad, dilation)
         self.seg_head = SingleConv(int(short_rate * stage_channels[0]), num_cls, 1, 0, 1)
 
@@ -396,52 +380,25 @@ class SimpleUNet(nn.Module):
 if __name__ == '__main__':
     # 确保有可用的CUDA设备
     if torch.cuda.is_available():
-        input_tensor = torch.randn(1, 3, 256, 256).cuda()
+        input = torch.randn(1, 3, 256, 256).cuda()
 
-        print("--- Testing Model with num_blocks = 1 (HalfConv NOT used) ---")
-        model_1 = SimpleUNet(
+        # 使用的参数 (ks=3, pad=1)
+        model = SimpleUNet(
             in_channels=3,
             num_cls=1,
-            ks=3,
-            stage_channels=[16, 32, 64, 128, 256],
-            num_blocks=[1, 1, 1, 1, 1],  # num_blocks=1, 不会触发 HalfConv
+            ks=3,  # (!!!) 将被传递给 Converse2D
+            stage_channels=[16, 16, 16, 16, 16],
+            num_blocks=[1, 1, 1, 1, 1],
             short_rate=0.5
         ).cuda()
 
-        flops_1, params_1 = profile(model_1, inputs=(input_tensor,))
-        output_1 = model_1(input_tensor)
+        flops, params = profile(model, inputs=(input,))
+        output = model(input)
 
-        print(f"Input shape: {input_tensor.shape}")
-        print(f"Output shape: {output_1.shape}")
-        print(f"FLOPs (G): {flops_1 / 1e9:.4f}")
-        print(f"Params (M): {params_1 / 1e6:.4f}")
-
-        # ---
-
-        print("\n--- Testing Model with num_blocks = 2 (HalfConv IS used) ---")
-        # (确保通道数为偶数以满足 HalfConv n_div=2 的要求)
-        model_2 = SimpleUNet(
-            in_channels=3,
-            num_cls=1,
-            ks=3,
-            stage_channels=[16, 32, 64, 128, 256],
-            num_blocks=[2, 2, 2, 2, 2],  # num_blocks=2, 将触发 HalfConv
-            short_rate=0.5
-        ).cuda()
-
-        flops_2, params_2 = profile(model_2, inputs=(input_tensor,))
-        output_2 = model_2(input_tensor)
-
-        print(f"Input shape: {input_tensor.shape}")
-        print(f"Output shape: {output_2.shape}")
-        print(f"FLOPs (G): {flops_2 / 1e9:.4f}")
-        print(f"Params (M): {params_2 / 1e6:.4f}")
-
-        # 比较
-        print("\n--- Comparison ---")
-        print(f"Params (M) [blocks=2 vs blocks=1]: {params_2 / 1e6:.4f} vs {params_1 / 1e6:.4f}")
-        print(f"FLOPs (G) [blocks=2 vs blocks=1]: {flops_2 / 1e9:.4f} vs {flops_1 / 1e9:.4f}")
-        print("\n(FLOPs 和 Params 增加，因为层数从1增加到2，但 HalfConv 使得增幅小于使用标准 Conv)")
-
+        print(f"\n--- Final Model Output (with Converse2D) ---")
+        print(f"Input shape: {input.shape}")
+        print(f"Output shape: {output.shape}")
+        print(f"FLOPs (G): {flops / 1e9}")
+        print(f"Params (M): {params / 1e6}")
     else:
         print("CUDA not available. Please run this on a machine with a GPU.")
