@@ -2,12 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from thop import profile
-
-from FCM import FCM
+# (!!! 新增 !!!)
+# 确保你已安装此库: pip install pytorch-wavelets
+from pytorch_wavelets import DWTForward
 
 
 # ----------------------------------------------------------------------
-# 0. 您提供的 Converse2D 模块 (粘贴在此处以便 Decoder 调用)
+# 0. 您提供的 Converse2D 模块 (不变)
 # ----------------------------------------------------------------------
 class Converse2D(nn.Module):
     """
@@ -159,14 +160,80 @@ class SingleConv(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 2. 编码器 (下采样) 模块 (不变)
+# (!!! 新增 !!!)
+# 2. 您提供的 RHDWT 模块
+# ----------------------------------------------------------------------
+class Residual_Haar_Discrete_Wavelet_Transform(nn.Module):
+    def __init__(self, in_channels, n=1):
+        super(Residual_Haar_Discrete_Wavelet_Transform, self).__init__()
+        # 残差路径卷积（stride=2 下采样，padding=1）
+        self.identety = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=in_channels * n,
+            kernel_size=3,
+            stride=2,
+            padding=1
+        )
+
+        # Haar 小波变换（单层分解）
+        self.DWT = DWTForward(J=1, wave='haar')
+
+        # 小波特征编码
+        self.dconv_encode = nn.Sequential(
+            nn.Conv2d(in_channels * 4, in_channels * n, 3, padding=1),
+            nn.LeakyReLU(inplace=True),
+        )
+
+    def _transformer(self, DMT1_yl, DMT1_yh):
+        """重组低频与三方向高频：输出 [N, 4*C, H/2, W/2]"""
+        list_tensor = []
+        a = DMT1_yh[0]  # J=1 仅一层
+        list_tensor.append(DMT1_yl)
+        for i in range(3):
+            list_tensor.append(a[:, :, i, :, :])
+        return torch.cat(list_tensor, 1)
+
+    def forward(self, x):
+        input = x
+        # Haar 分解
+        DMT1_yl, DMT1_yh = self.DWT(x)  # yl: [N,C,H/2,W/2], yh[0]: [N,C,3,H/2,W/2]
+        # 重组 + 编码
+        DMT = self._transformer(DMT1_yl, DMT1_yh)
+        x = self.dconv_encode(DMT)
+        # 残差下采样
+        res = self.identety(input)
+        # 融合
+        out = torch.add(x, res)
+        return out
+
+
+# ----------------------------------------------------------------------
+# 3. 编码器 (下采样) 模块 (!!! 已修改 !!!)
 # ----------------------------------------------------------------------
 class Encoder(nn.Module):
     def __init__(self, in_channels, stage_channels, num_blocks, ks, pad, dilation):
         super().__init__()
         self.depth = len(stage_channels)
-        self.down = nn.MaxPool2d(2)
 
+        # (!!! 已修改 !!!)
+        # 移除了 self.down = nn.MaxPool2d(2)
+        # self.down = nn.MaxPool2d(2)
+
+        # (!!! 新增 !!!)
+        # 创建一个 ModuleList 来存储 (depth-1) 个 RHDWT 下采样层
+        self.down_layers = nn.ModuleList()
+        for i in range(self.depth - 1):
+            # U-Net 的下采样层通常不改变通道数 (MaxPool)，
+            # 随后的 en_layers[i] 期望的输入通道是 stage_channels[i]。
+            # 因此，我们设置 n=1，使 RHDWT 的输出通道 = 输入通道。
+            self.down_layers.append(
+                Residual_Haar_Discrete_Wavelet_Transform(
+                    in_channels=stage_channels[i],
+                    n=1  # (!!!) 关键：保持通道数不变
+                )
+            )
+
+        # (!!! 不变 !!!)
         self.en_layer0 = SingleConv(in_channels, stage_channels[0], ks, pad, dilation)
         self.en_layers = nn.ModuleList()
         for i in range(1, self.depth):
@@ -180,54 +247,47 @@ class Encoder(nn.Module):
         shortcuts = []
         x = self.en_layer0(x)
         shortcuts.append(x)
+
+        # (!!! 已修改 !!!)
+        # 循环 (depth-2) 次
         for i in range(self.depth - 2):
-            x = self.down(x)
+            # x = self.down(x)  # 替换
+            x = self.down_layers[i](x)  # 使用第 i 个 RHDWT 下采样
             x = self.en_layers[i](x)
             shortcuts.append(x)
-        x = self.down(x)
+
+        # (!!! 已修改 !!!)
+        # 最后第 (depth-1) 次下采样
+        # x = self.down(x) # 替换
+        x = self.down_layers[self.depth - 2](x)  # 使用最后一个 RHDWT 下采样
+
+        # (!!! 不变 !!!)
         x = self.en_layers[self.depth - 2](x)
         return x, shortcuts
 
 
-# ... (需要先导入 FCM 类) ...
-
 # ----------------------------------------------------------------------
-# 3. 跳跃连接处理模块 (!!! 修改 !!!)
+# 4. 跳跃连接处理模块 (不变)
 # ----------------------------------------------------------------------
 class SkipConnections(nn.Module):
     def __init__(self, stage_channels, short_rate):
         super().__init__()
         self.depth = len(stage_channels)
         self.short_layers = nn.ModuleList()
-
-        # (!!! 新增 !!!)
-        self.fcm_layers = nn.ModuleList() # 为每一层 skip path 创建一个 FCM
-
         for i in range(self.depth - 1):
-            # 1x1 卷积层 (不变)
-            out_ch = int(short_rate * stage_channels[i])
-            layer = SingleConv(stage_channels[i], out_ch, 1, 0, 1)
+            layer = SingleConv(stage_channels[i], int(short_rate * stage_channels[i]), 1, 0, 1)
             self.short_layers.append(layer)
-
-            # (!!! 新增 !!!)
-            # 添加 FCM 模块，通道数与 1x1 卷积的输出匹配
-            self.fcm_layers.append(FCM(channels=out_ch))
 
     def forward(self, shortcuts):
         refined_shortcuts = []
         for i in range(len(shortcuts)):
-            # (!!! 修改 !!!)
-            # 1. 先通过 1x1 卷积调整通道
             refined = self.short_layers[i](shortcuts[i])
-            # 2. 再通过 FCM 进行精炼
-            refined = self.fcm_layers[i](refined)
-
             refined_shortcuts.append(refined)
         return refined_shortcuts
 
 
 # ----------------------------------------------------------------------
-# 4. 瓶颈层 (Bottleneck) 模块 (不变)
+# 5. 瓶颈层 (Bottleneck) 模块 (不变)
 # ----------------------------------------------------------------------
 class Bottleneck(nn.Module):
     def __init__(self, in_channels, mid_channels, num_blocks, ks, pad, dilation):
@@ -243,7 +303,7 @@ class Bottleneck(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 5. 解码器 (上采样) 模块 (!!! 已修改 !!!)
+# 6. 解码器 (上采样) 模块 (不变, 沿用你的 Converse2D)
 # ----------------------------------------------------------------------
 class Decoder(nn.Module):
     """
@@ -338,7 +398,7 @@ class Decoder(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 6. 重构后的 SimpleUNet (主模块) (不变)
+# 7. 重构后的 SimpleUNet (主模块) (不变)
 # ----------------------------------------------------------------------
 class SimpleUNet(nn.Module):
     def __init__(self, in_channels, num_cls, ks=3, dilation=1, stage_channels=5 * [32], num_blocks=5 * [1],
@@ -349,7 +409,9 @@ class SimpleUNet(nn.Module):
 
         self.pad = dilation * (ks - 1) // 2
 
+        # (!!!) 这里的 Encoder 实例化会自动调用我们修改后的 Encoder
         self.encoder = Encoder(in_channels, stage_channels, num_blocks, ks, self.pad, dilation)
+
         self.skip_connections = SkipConnections(stage_channels, short_rate)
         self.bottleneck = Bottleneck(
             in_channels=stage_channels[-1],
@@ -359,9 +421,7 @@ class SimpleUNet(nn.Module):
             pad=self.pad,
             dilation=dilation
         )
-        # (!!! 注意 !!!)
-        # Decoder 的初始化调用不变，
-        # 因为 ks 和 pad 已经通过参数传递进去了
+        # (!!!) 这里的 Decoder 实例化不变
         self.decoder = Decoder(stage_channels, num_blocks, short_rate, ks, self.pad, dilation)
         self.seg_head = SingleConv(int(short_rate * stage_channels[0]), num_cls, 1, 0, 1)
 
@@ -375,7 +435,7 @@ class SimpleUNet(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 7. 测试代码 (不变)
+# 8. 测试代码 (不变)
 # ----------------------------------------------------------------------
 if __name__ == '__main__':
     # 确保有可用的CUDA设备
@@ -387,7 +447,7 @@ if __name__ == '__main__':
             in_channels=3,
             num_cls=1,
             ks=3,  # (!!!) 将被传递给 Converse2D
-            stage_channels=[16, 16, 16, 16, 16],
+            stage_channels=[16, 16, 16, 16, 16],  # 编码器各阶段通道
             num_blocks=[1, 1, 1, 1, 1],
             short_rate=0.5
         ).cuda()
@@ -395,10 +455,30 @@ if __name__ == '__main__':
         flops, params = profile(model, inputs=(input,))
         output = model(input)
 
-        print(f"\n--- Final Model Output (with Converse2D) ---")
+        print(f"\n--- Final Model Output (with RHDWT Downsampling + Converse2D Upsampling) ---")
         print(f"Input shape: {input.shape}")
         print(f"Output shape: {output.shape}")
         print(f"FLOPs (G): {flops / 1e9}")
         print(f"Params (M): {params / 1e6}")
     else:
         print("CUDA not available. Please run this on a machine with a GPU.")
+
+        # (!!!) CPU 测试（用于没有GPU的环境）
+        print("--- Running on CPU (for verification) ---")
+        input_cpu = torch.randn(1, 3, 256, 256)
+        model_cpu = SimpleUNet(
+            in_channels=3,
+            num_cls=1,
+            ks=3,
+            stage_channels=[16, 16, 16, 16, 16],
+            num_blocks=[1, 1, 1, 1, 1],
+            short_rate=0.5
+        )
+
+        # 警告：Converse2D 在 CPU 上的 FFT 可能较慢
+        with torch.no_grad():
+            output_cpu = model_cpu(input_cpu)
+
+        print(f"Input shape (CPU): {input_cpu.shape}")
+        print(f"Output shape (CPU): {output_cpu.shape}")
+        print("Model runs successfully on CPU.")

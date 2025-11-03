@@ -26,7 +26,7 @@ IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 256
 PIN_MEMORY = True
 NUM_CLASSES = 1  # <-- 修改点: 二分类 (BCE) 模式下, 输出通道为 1
-SAVE_PATH = "FCMSkip1+Converse2D[64,128,256,512,1024]"  # <-- 修改点: 更改保存名称1
+SAVE_PATH = "RHDWT+Converse2D[64,128,256,512,1024]rate1"  # <-- 修改点: 更改保存名称1
 early_stop_patience = 20
 early_stop_counter = 0
 stage_channels = [64, 128, 256, 512, 1024]
@@ -107,7 +107,7 @@ def main():
         num_cls=NUM_CLASSES,  # <-- 修改点: 传入 num_cls=1
         stage_channels=stage_channels,
         num_blocks=[1, 1, 1, 1, 1],
-        short_rate=0.5,
+        short_rate=1,
         # adw=True
     ).to(DEVICE)
 
