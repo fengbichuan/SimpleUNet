@@ -184,8 +184,8 @@ def main():
     loss_fn = CombinedLoss(weight_bce=0.5, weight_dice=0.5)  # <-- 修改点: 更换损失函数
 
     # 优化器
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
+    #optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     # (可选) 学习率调度器
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 'max', patience=5, factor=0.1, verbose=True

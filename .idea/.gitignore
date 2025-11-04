@@ -6,3 +6,54 @@
 # Datasource local storage ignored files
 /dataSources/
 /dataSources.local.xml
+# 忽略大文件目录
+# IDE
+/shelf/
+/workspace.xml
+/.idea/
+*.iml
+
+# 编辑器
+.vscode/
+*.swp
+*.swo
+
+# 缓存
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# 环境
+.env
+.venv/
+venv/
+env/
+
+# 构建产物
+build/
+dist/
+*.egg-info/
+
+# 大文件和数据
+Experience-isic2018/
+*.pth
+*.model
+*.h5
+*.hdf5
+*.weights
+*.bin
+*.dat
+*.npz
+*.npy
+
+# 压缩包
+*.tar
+*.gz
+*.zip
+*.7z
+
+# 日志
+*.log
+*.out
