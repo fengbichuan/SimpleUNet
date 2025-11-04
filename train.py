@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import os
-import csv  # [新增] 导入 CSV 库
+import csv
+import matplotlib.pyplot as plt  # [新增] 导入 matplotlib
 
 from thop import profile
 from tqdm import tqdm
@@ -26,10 +27,10 @@ IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 256
 PIN_MEMORY = True
 NUM_CLASSES = 1  # <-- 修改点: 二分类 (BCE) 模式下, 输出通道为 1
-SAVE_PATH = "HDPAskip+Converse2D[64,128,256,512,1024]"
+SAVE_PATH = "MBRC+Converse2D[16,32,64,128,256]"
 early_stop_patience = 10
 early_stop_counter = 0
-stage_channels = [64, 128, 256, 512, 1024]
+stage_channels = [16,32,64,128,256]
 
 
 def train_fn(loader, model, optimizer, loss_fn, device):
@@ -67,7 +68,7 @@ def train_fn(loader, model, optimizer, loss_fn, device):
     return avg_loss  # [修改] 返回平均训练损失
 
 
-# [新增] 保存结果到 CSV 文件的函数
+# [新增] 保存结果到 CSV 文件的函数 (代码不变)
 def save_results_to_csv(filepath, header, data_rows):
     """
     将结果列表保存到 CSV 文件
@@ -85,6 +86,61 @@ def save_results_to_csv(filepath, header, data_rows):
         print(f"Metrics successfully saved to {filepath}")
     except Exception as e:
         print(f"Error saving CSV to {filepath}: {e}")
+
+
+# [新增] 保存训练曲线图的函数
+def save_plots(results_list, save_path_prefix):
+    """
+    根据 results_list 绘制 Loss, IoU, Dice 曲线并保存为一张图片。
+    :param results_list: 包含指标数据的列表 (list of lists)
+    :param save_path_prefix: 图片的保存路径前缀 (e.g., "model_name")
+    """
+    try:
+        # 1. 从 results_list 中解压数据
+        # 格式: [epoch + 1, train_loss, val_loss, IoU_foreground, Dice_foreground]
+        epochs = [row[0] for row in results_list]
+        train_losses = [row[1] for row in results_list]
+        val_losses = [row[2] for row in results_list]
+        val_ious = [row[3] for row in results_list]
+        val_dices = [row[4] for row in results_list]
+
+        # 2. 创建一个包含两个子图的画布 (2行1列)
+        # fig 是整个画布, (ax1, ax2) 是两个子图
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+        fig.suptitle('Training Metrics', fontsize=16)
+
+        # 3. 绘制第一个子图：Loss 曲线
+        ax1.plot(epochs, train_losses, 'b-o', label='Train Loss')
+        ax1.plot(epochs, val_losses, 'r-o', label='Validation Loss')
+        ax1.set_title('Training and Validation Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.legend()
+        ax1.grid(True)
+
+        # 4. 绘制第二个子图：Metrics (IoU & Dice) 曲线
+        ax2.plot(epochs, val_ious, 'g-s', label='Validation IoU (FG)')
+        ax2.plot(epochs, val_dices, 'm-^', label='Validation Dice (FG)')
+        ax2.set_title('Validation Metrics (IoU & Dice)')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Score')
+        # (可选) 设置 Y 轴范围，使曲线更清晰
+        # ax2.set_ylim([0.5, 1.0])
+        ax2.legend()
+        ax2.grid(True)
+
+        # 5. 调整布局并保存图片
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])  # 调整布局，为大标题留出空间
+
+        # 定义保存路径
+        plot_save_path = f"{save_path_prefix}_metrics_plot.png"
+
+        plt.savefig(plot_save_path)
+        plt.close(fig)  # 关闭画布，释放内存
+        print(f"Metrics plot successfully saved to {plot_save_path}")
+
+    except Exception as e:
+        print(f"Error saving plots: {e}")
 
 
 def main():
@@ -108,6 +164,7 @@ def main():
         stage_channels=stage_channels,
         num_blocks=[1, 1, 1, 1, 1],
         short_rate=0.5,
+        ks_psf=13
         # adw=True
     ).to(DEVICE)
 
@@ -138,10 +195,10 @@ def main():
     best_iou_fg = -1.0
     best_dice_fg = -1.0
 
-    # [新增] 用于存储 CSV 结果的列表和表头
+    # [新增] 用于存储 CSV 结果的列表和表头 (代码不变)
     results_list = []
     csv_header = ["Epoch", "Train Loss", "Val Loss", "Val IoU (FG)", "Val Dice (FG)"]
-    # [新增] 定义 CSV 文件的保存路径 (基于模型保存路径)
+    # [新增] 定义 CSV 文件的保存路径 (基于模型保存路径) (代码不变)
     csv_save_path = f"{SAVE_PATH}.csv"
 
     for epoch in range(NUM_EPOCHS):
@@ -160,10 +217,17 @@ def main():
         print(f"  IoU (Foreground):     {IoU_foreground:.4f}")
         print(f"  Dice (Foreground):    {Dice_foreground:.4f}")
 
-        # [新增] 将本轮次的结果添加到列表中
-        epoch_data = [epoch + 1, train_loss, val_loss, IoU_foreground, Dice_foreground]
+        # [新增] 将本轮次的结果添加到列表中 (代码不变)
+        # [修改] 将本轮次的结果添加到列表中
+        # 使用 .item() 将 Tensor 转换为 Python 标量 (float)，以供 matplotlib 绘图
+        epoch_data = [
+            epoch + 1,
+            train_loss,
+            val_loss,  # <-- 去掉 .item()
+            IoU_foreground,  # <-- 去掉 .item()
+            Dice_foreground  # <-- 去掉 .item()
+        ]
         results_list.append(epoch_data)
-
         # 1. (可选) 更新学习率调度器 (基于 Dice)
         scheduler.step(Dice_foreground)
 
@@ -194,6 +258,13 @@ def main():
 
     # [新增] 在训练结束后，调用函数保存 CSV
     save_results_to_csv(csv_save_path, csv_header, results_list)
+
+    # [新增] 在训练结束后，调用函数保存绘图
+    # 我们使用 SAVE_PATH ("MBRC+Converse2D[...]") 作为图片文件名的前缀
+    if results_list:  # 确保列表不为空
+        save_plots(results_list, SAVE_PATH)
+    else:
+        print("No results to plot.")
 
 
 if __name__ == "__main__":
