@@ -20,17 +20,17 @@ DATA_PATH = r"D:\对照试验模型\dataset\9-isic2018"
 # 超参数
 LEARNING_RATE = 0.0003
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 4
+BATCH_SIZE = 8
 NUM_EPOCHS = 300
 NUM_WORKERS = 0
 IMAGE_HEIGHT = 256
 IMAGE_WIDTH = 256
 PIN_MEMORY = True
 NUM_CLASSES = 1  # <-- 修改点: 二分类 (BCE) 模式下, 输出通道为 1
-SAVE_PATH = "MBRC+Converse2D[16,32,64,128,256]"
-early_stop_patience = 10
+SAVE_PATH = "MBRC+Converse2D[16,16,16,16,16]3"
+early_stop_patience = 300
 early_stop_counter = 0
-stage_channels = [16,32,64,128,256]
+stage_channels = [16,16,16,16,16]
 
 
 def train_fn(loader, model, optimizer, loss_fn, device):
@@ -188,7 +188,7 @@ def main():
 
     # (可选) 学习率调度器
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 'max', patience=3, factor=0.1, verbose=True
+        optimizer, 'max', patience=5, factor=0.1, verbose=True
     )
 
     # --- 4. 训练循环 ---
@@ -208,9 +208,17 @@ def main():
         train_loss = train_fn(train_loader, model, optimizer, loss_fn, DEVICE)
 
         # <-- 修改点: 新的评估函数不再需要 num_cls，且返回的直接是前景指标
-        val_loss, IoU_foreground, Dice_foreground = calculate_metrics_and_loss(
+        # [修改] 调用评估函数，并确保将返回值转换为 Python float
+        # 这一步是关键，确保后续的 plotting 和 CSV 保存都能正常进行
+        val_loss_tensor, iou_fg_tensor, dice_fg_tensor = calculate_metrics_and_loss(
             val_loader, model, loss_fn, DEVICE
         )
+        # 将可能的 Tensor 转换为 Python float。如果已经是 float，.item() 会报错，
+        # 所以我们做个判断。但更安全的做法是直接在 metrics.py 中处理。
+        # 这里为了兼容性，我们直接假设它们可能是 Tensor，并尝试转成float。
+        val_loss = val_loss_tensor.item() if isinstance(val_loss_tensor, torch.Tensor) else float(val_loss_tensor)
+        IoU_foreground = iou_fg_tensor.item() if isinstance(iou_fg_tensor, torch.Tensor) else float(iou_fg_tensor)
+        Dice_foreground = dice_fg_tensor.item() if isinstance(dice_fg_tensor, torch.Tensor) else float(dice_fg_tensor)
 
         print(f"\nValidation Results:")
         print(f"  Avg Loss: {val_loss:.4f}")

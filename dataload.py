@@ -67,6 +67,10 @@ def get_loaders(data_path, batch_size, image_height, image_width, num_workers=4,
     TRAIN_MASK_DIR = os.path.join(data_path, "train/masks")
     VAL_IMG_DIR = os.path.join(data_path, "val/images")
     VAL_MASK_DIR = os.path.join(data_path, "val/masks")
+    TRAIN_IMG_DIR = os.path.join(data_path, "train/images1")
+    TRAIN_MASK_DIR = os.path.join(data_path, "train/masks1")
+    VAL_IMG_DIR = os.path.join(data_path, "val/images1")
+    VAL_MASK_DIR = os.path.join(data_path, "val/masks1")
 
     # 训练集数据增强
     train_transform = A.Compose(

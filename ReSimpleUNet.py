@@ -5,7 +5,7 @@ from thop import profile
 
 
 # ----------------------------------------------------------------------
-# + 新增: MBRConv5 模块 (结构重参数化) (不变)
+# + 新增: MBRConv5 模块 (结构重参数化) (!!! 按方案A修改 !!!)
 # ----------------------------------------------------------------------
 class MBRConv5(nn.Module):
     def __init__(self, in_channels, out_channels, rep_scale=4):
@@ -51,6 +51,9 @@ class MBRConv5(nn.Module):
         self.weight1 = nn.Parameter(torch.zeros_like(self.conv_out.weight))
         nn.init.xavier_normal_(self.weight1)
 
+        # (!!!) 方案A：新增 ReLU
+        self.relu = nn.ReLU(inplace=True)
+
     def forward(self, inp):
         x1 = self.conv(inp)
         x2 = self.conv1(inp)
@@ -70,7 +73,9 @@ class MBRConv5(nn.Module):
 
         final_weight = self.conv_out.weight + self.weight1
         out = F.conv2d(x, final_weight, self.conv_out.bias)
-        return out
+
+        # (!!!) 方案A：在末尾应用 ReLU
+        return self.relu(out)
 
     # slim方法：仅在推理时使用
     def slim(self):
@@ -146,7 +151,13 @@ class MBRConv5(nn.Module):
         if final_conv_bias is not None:
             fused_bias = fused_bias + final_conv_bias
 
-        return fused_weight, fused_bias
+        # (!!!) 方案A：构造一个融合后的新 Conv+ReLU 模块
+        fused_conv = nn.Conv2d(self.in_channels, self.out_channels, 5, 1, 2, bias=True)
+        fused_conv.weight.data.copy_(fused_weight)
+        fused_conv.bias.data.copy_(fused_bias)
+
+        # (!!!) 方案A：返回一个包含激活的序列，使其与 forward 路径等价
+        return nn.Sequential(fused_conv, self.relu)
 
 
 # ----------------------------------------------------------------------
@@ -244,30 +255,24 @@ class Converse2D(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 1. 基础卷积块 (!!! 关键修改 !!!)
+# 1. 基础卷积块 (!!! 按方案A修改 !!!)
 # ----------------------------------------------------------------------
 class SingleConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, pad=1, dilation=1):
         super().__init__()
 
-        # (!!!) 关键逻辑 (!!!)
-        # 1. 直接在 nn.Sequential 内部定义卷积层
-        # 2. 这消除了 'self.conv' 和 'self.single_conv[0]' 之间的别名
-        # 3. 从而让 thop 的扫描器能正确工作
-
+        # (!!!) 方案A 关键逻辑 (!!!)
         if kernel_size > 1:
-            # 使用 MBRConv5 作为特征提取器
-            conv_layer = MBRConv5(in_channels, out_channels, rep_scale=4)
+            # MBRConv5 已经内置了 (Conv + 内部BNs + ReLU)
+            # 所以我们直接使用它，不再需要额外的 BN 或 ReLU
+            self.single_conv = MBRConv5(in_channels, out_channels, rep_scale=4)
         else:
-            # 保持原始的 1x1 卷积
-            conv_layer = nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0, dilation=1, bias=False)
-
-        # 保持 Conv -> BN -> ReLU 的结构
-        self.single_conv = nn.Sequential(
-            conv_layer,  # (!!!) 直接在这里使用，不要赋给 self.conv
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
+            # 1x1 卷积保持原始的 Conv -> BN -> ReLU 结构
+            self.single_conv = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0, dilation=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            )
 
     def forward(self, x):
         return self.single_conv(x)
@@ -424,36 +429,3 @@ class SimpleUNet(nn.Module):
         x = self.decoder(x_after_bottleneck, refined_shortcuts)
         output = self.seg_head(x)
         return output
-
-
-# ----------------------------------------------------------------------
-# 7. 测试代码 (不变)
-# ----------------------------------------------------------------------
-if __name__ == '__main__':
-    if torch.cuda.is_available():
-        input = torch.randn(1, 3, 256, 256).cuda()
-
-        model = SimpleUNet(
-            in_channels=3,
-            num_cls=1,
-            ks=3,  # 用于 SingleConv (将触发 MBRConv5)
-            ks_psf=13,  # 用于 Converse2D
-            stage_channels=[16, 16, 16, 16, 16],
-            num_blocks=[1, 1, 1, 1, 1],
-            short_rate=0.5
-        ).cuda()
-
-        # 切换到评估模式 (对于BN层和thop很重要)
-        model.eval()
-
-        # (!!!) thop 应该现在可以正常运行了
-        flops, params = profile(model, inputs=(input,))
-        output = model(input)
-
-        print(f"\n--- Final Model Output (with MBRConv5 + Converse2D, ks_psf=13) ---")
-        print(f"Input shape: {input.shape}")
-        print(f"Output shape: {output.shape}")
-        print(f"FLOPs (G): {flops / 1e9}")
-        print(f"Params (M): {params / 1e6}")
-    else:
-        print("CUDA not available. Please run this on a machine with a GPU.")
