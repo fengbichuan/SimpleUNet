@@ -1,182 +1,410 @@
-import os
-import adata
-import time
-
-
+import sys
+import tushare as ts
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
+import time
+import warnings
+# [!!] 修正: 移除未使用的 tqdm 导入
+# from tqdm import tqdm
 
-# --- 配置项 ---
-MONITOR_INTERVAL_SECONDS = 60  # 每次扫描的间隔时间（秒）
-MA5_DAYS = 5  # 5日均线
-MA10_DAYS = 10  # 10日均线
-MA20_DAYS = 20  # 20日均线
-MA60_DAYS = 60  # 60日均线
-TURNOVER_THRESHOLD = 5  # 换手率阈值 (10%)
-# ---
+# --- PyQt5 Imports [!! 已修改] ---
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLineEdit, QTextEdit, QProgressBar, QTableWidget,
+    QLabel, QTableWidgetItem, QHeaderView, QMessageBox
+)
+from PyQt5.QtCore import QThread, QObject, pyqtSignal, pyqtSlot as Slot, Qt
 
-# 用于存储今天已提醒过的股票，避免重复提醒
-alerted_stocks_today = set()
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
-def get_hot_stocks():
+# -----------------------------------------------------------------
+# 1. 工作线程 (Worker)
+# -----------------------------------------------------------------
+# QObject必须是所有工作类的基类，以便它可以被移动到QThread
+class Worker(QObject):
     """
-    获取“人气龙头/热点股” (条件 4)
-    使用 all_capital_flow_east() 获取近5日概念资金流入的龙头股
+    工作线程，用于处理所有耗时的Tushare API请求和数据分析
     """
-    print("=" * 50)
-    print("正在获取热门/龙头股票列表 (Fetching hot/leader stock list)...")
-    # --- 已修改: 使用 'days_type=5' ---
-    print("使用接口 (Using API): adata.stock.market.all_capital_flow_east(days_type=5)")
+    # --- 定义信号 ---
+    log = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    found = pyqtSignal(str, str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
 
-    try:
-        # 1. 获取近5日所有概念的资金流向
-        df_flow = adata.stock.market.all_capital_flow_east(days_type=1)
+    def __init__(self):
+        super().__init__()
+        self.pro = None
+        self.is_running = False
 
-        # 2. 筛选出主力净流入为正的“热门概念”
-        hot_concepts = df_flow[df_flow['main_net_inflow'] > 0]
-
-        # 3. 提取这些热门概念的“龙头股”
-        hot_stocks_map = {}
-        for _, row in hot_concepts.iterrows():
-            stock_code = row['stock_code']
-            stock_name = row['stock_name']
-            if stock_code not in hot_stocks_map:
-                # 存储 股票代码 -> 股票名称 的映射
-                hot_stocks_map[stock_code] = stock_name
-
-        print(
-            f"获取到 {len(hot_stocks_map)} 只【近5日】热门股票待监控 (Found {len(hot_stocks_map)} hot stocks to monitor).")
-        print("=" * 50)
-        return hot_stocks_map
-
-    except Exception as e:
-        print(f"获取热门股票列表失败 (Error fetching hot stocks): {e}")
-        return {}
-
-
-def check_stock(stock_code, stock_name):
-    """
-    检查单只股票是否满足所有条件 (1, 2, 3, 5)
-    """
-    global alerted_stocks_today
-
-    try:
-        # 1. 获取日K数据
-        # (adata.stock.market.get_market() 接口在文档中显示返回K线行情)
-        df = adata.stock.market.get_market(stock_code=stock_code, k_type=1, adjust_type=1)
-
-        if len(df) < MA60_DAYS + 1:
+    def run_scan(self, token):
+        """
+        主扫描逻辑，这是在QThread中执行的函数
+        """
+        if self.is_running:
             return
 
-        data = df.iloc[-(MA60_DAYS + 1):]
-        today = data.iloc[-1]
-        yesterday = data.iloc[-2]
+        self.is_running = True
 
-        # 检查1 (前置): 是否为阳线 (收盘 > 开盘)
-        is_yang_line = today['close'] > today['open']
-        if not is_yang_line:
-            return
-
-        # 计算所有均线
-        ma5 = data['close'].iloc[-MA5_DAYS:].mean()
-        ma10 = data['close'].iloc[-MA10_DAYS:].mean()
-        ma20 = data['close'].iloc[-MA20_DAYS:].mean()
-        ma60 = data['close'].iloc[-MA60_DAYS:].mean()
-
-        # 检查1: 5日均线在阳线实体中
-        condition1 = (today['open'] < ma5 < today['close'])
-
-        # 检查2: 较上一个交易日放量
-        condition2 = today['volume'] > yesterday['volume']
-
-        # 检查3: 处于上升趋势 (MA5 > MA10 > MA20 > MA60)
-        condition3 = (ma5 > ma10) and (ma10 > ma20) and (ma20 > ma60)
-
-        # 检查5: 换手率大于 10%
-        # (文档显示 'turnover_ratio' 字段是换手率(%))
-        condition5 = today['turnover_ratio'] > TURNOVER_THRESHOLD
-
-        # 4. 汇总结果并提醒
-        if condition1 and condition2 and condition3 and condition5:
-            current_date = datetime.now().strftime('%Y-%m-%d')
-            alert_key = f"{stock_code}_{current_date}"
-
-            if not any(alert.endswith(current_date) for alert in alerted_stocks_today):
-                print(f"\n新的一天 ({current_date})，重置提醒列表 (New day, resetting alert list).\n")
-                alerted_stocks_today.clear()
-
-            if alert_key not in alerted_stocks_today:
-                alerted_stocks_today.add(alert_key)
-                print("\n" + "=" * 50)
-                print(f"  *** 实时股票提醒 (Real-time Stock Alert) ***")
-                print(f"  时间 (Time):   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"  股票 (Stock):  {stock_name} ({stock_code})")
-                print(f"  现价 (Price):  {today['close']:.2f}")
-                print_conditions(today, yesterday, ma5, ma10, ma20, ma60)
-                print("=" * 50 + "\n")
-
-    except Exception as e:
-        pass
-
-
-def print_conditions(today, yesterday, ma5, ma10, ma20, ma60):
-    """辅助函数：格式化打印满足的条件详情"""
-    print("\n  --- 满足以下所有条件 (Met all conditions) ---")
-    print(f"  [✓] 1. 五日线在阳线实体中 (MA5 in Yang Body)")
-    print(f"      - ( 开盘 (Open): {today['open']:.2f} < 均线 (MA5): {ma5:.2f} < 收盘 (Close): {today['close']:.2f} )")
-    print(f"\n  [✓] 2. 较昨日放量 (Increased Volume)")
-    print(f"      - 今日 (Today): {today['volume']:,.0f}")
-    print(f"      - 昨日 (Yday):  {yesterday['volume']:,.0f}")
-    print(f"\n  [✓] 3. 处于上升趋势 (Upward Trend - 多头排列)")
-    print(f"      - ( MA5: {ma5:.2f} > MA10: {ma10:.2f} > MA20: {ma20:.2f} > MA60: {ma60:.2f} )")
-    print(f"\n  [✓] 4. 人气/热点股 (Hot/Leader Stock)")
-    print(f"      - (已通过【近5日】概念资金流筛选, Implied by 'near 5 days' concept flow filter)")
-    print(f"\n  [✓] 5. 换手率 > {TURNOVER_THRESHOLD}% (Turnover > {TURNOVER_THRESHOLD}%)")
-    print(f"      - 换手 (Turnover): {today['turnover_ratio']:.2f}%")
-
-
-def main_monitor():
-    """
-    主监控循环
-    """
-    hot_stocks_map = get_hot_stocks()
-    if not hot_stocks_map:
-        print("未能获取热门股票列表，程序退出 (Failed to get hot stocks, exiting).")
-        return
-
-    print(f"\n开始实时监控 {len(hot_stocks_map)} 只股票 (Starting real-time monitoring)...")
-    print(f"监控周期 (Check interval): {MONITOR_INTERVAL_SECONDS} 秒 (seconds)")
-    print("按 Ctrl+C 停止 (Press Ctrl+C to stop).")
-
-    while True:
         try:
-            scan_start_time = datetime.now()
-            print(f"\n--- {scan_start_time.strftime('%H:%M:%S')} 开始新一轮扫描 (New scan cycle) ---")
+            # -----------------------------------------------------------------
+            # 1. 初始化 Tushare
+            # -----------------------------------------------------------------
+            self.log.emit("正在初始化Tushare...")
+            if not token:
+                raise Exception("Tushare Token 不能为空！")
 
-            count = 0
-            total = len(hot_stocks_map)
+            ts.set_token(token)
+            self.pro = ts.pro_api()
+            # 尝试连接
+            self.pro.trade_cal(limit=1)
+            self.log.emit("Tushare 连接成功。")
 
-            for stock_code, stock_name in hot_stocks_map.items():
-                count += 1
-                print(f"  正在检查 ({count}/{total}): {stock_name} ({stock_code})...", end='\r')
-                check_stock(stock_code, stock_name)
-                time.sleep(0.2)
+            # -----------------------------------------------------------------
+            # 2. 获取交易日期
+            # -----------------------------------------------------------------
+            self.log.emit("正在获取交易日期...")
+            T_1_DATE, T_2_DATE = self.get_trade_dates()
+            self.log.emit(f"目标扫描日期 (T-1): {T_1_DATE}")
+            self.log.emit(f"成交量对比日期 (T-2): {T_2_DATE}")
 
-            print(f"\n--- {datetime.now().strftime('%H:%M:%S')} 本轮扫描完成 (Scan complete) ---")
-            print(
-                f"等待 {MONITOR_INTERVAL_SECONDS} 秒后开始下一轮... (Waiting {MONITOR_INTERVAL_SECONDS}s for next cycle...)")
-            time.sleep(MONITOR_INTERVAL_SECONDS)
+            # -----------------------------------------------------------------
+            # 3. 获取待扫描的股票列表
+            # -----------------------------------------------------------------
+            self.log.emit("正在获取待扫描股票列表...")
+            stock_dict = self.get_scan_list(T_1_DATE)
+            if not stock_dict:
+                raise Exception("没有获取到股票列表，程序退出。")
 
-        except KeyboardInterrupt:
-            print("\n监控已停止 (Monitoring stopped by user).")
-            break
+            total_stocks = len(stock_dict)
+            self.log.emit(f"\n--- 开始扫描 {total_stocks} 只股票 ---")
+
+            # -----------------------------------------------------------------
+            # 4. 循环扫描
+            # -----------------------------------------------------------------
+            results_list = []
+            start_time = time.time()
+
+            for i, (code, name) in enumerate(stock_dict.items()):
+                if not self.is_running:  # 允许外部停止
+                    self.log.emit("扫描被手动中止。")
+                    break
+
+                # Tushare Pro 有调用频率限制
+                time.sleep(0.2)  # 保持 0.2 秒延迟 (安全起见)
+
+                # 检查股票
+                match = self.check_stock(code, T_1_DATE)
+
+                if match:
+                    results_list.append((code, name))
+                    # 发送“找到”信号
+                    self.found.emit(code, name)
+                    self.log.emit(f"  >> 找到匹配: {code} ({name})")
+
+                # 更新进度条
+                progress_percent = int((i + 1) * 100 / total_stocks)
+                self.progress.emit(progress_percent)
+
+            # -----------------------------------------------------------------
+            # 5. 输出结果
+            # -----------------------------------------------------------------
+            end_time = time.time()
+            self.log.emit("\n--- 扫描完成 ---")
+            self.log.emit(f"总耗时: {end_time - start_time:.2f} 秒")
+
+            if results_list:
+                final_msg = f"扫描完成：共找到 {len(results_list)} 只满足条件的股票。"
+            else:
+                final_msg = "扫描完成：未找到满足所有条件的股票。"
+
+            self.log.emit(final_msg)
+            self.finished.emit(final_msg)
+
         except Exception as e:
-            print(f"主循环出错 (Error in main loop): {e}")
-            print("30秒后重试 (Retrying in 30s)...")
-            time.sleep(30)
+            error_msg = f"程序运行出错: {e}"
+            self.log.emit(error_msg)
+            self.error.emit(error_msg)
+        finally:
+            self.is_running = False
+
+    def stop_scan(self):
+        """
+        外部调用的停止方法
+        """
+        self.is_running = False
+
+    # -----------------------------------------------------------------
+    # 以下是你原来的辅助函数，现在作为Worker类的方法
+    # -----------------------------------------------------------------
+
+    def get_trade_dates(self):
+        """
+        获取最近的两个交易日 (T-1 和 T-2)
+        """
+        today_str = datetime.now().strftime('%Y%m%d')
+        start_date_str = (datetime.now() - timedelta(days=60)).strftime('%Y%m%d')
+
+        trade_cal = self.pro.trade_cal(exchange='', start_date=start_date_str, end_date=today_str)
+        open_days = trade_cal[trade_cal['is_open'] == 1]
+        recent_open_days = open_days[open_days['cal_date'] < today_str]
+
+        if len(recent_open_days) < 2:
+            raise Exception("无法获取足够的交易日数据，请检查Tushare连接或是否处于长假期间。")
+
+        recent_trade_days = recent_open_days.head(2)
+        T_1_DATE = recent_trade_days.iloc[0]['cal_date']
+        T_2_DATE = recent_trade_days.iloc[1]['cal_date']
+
+        return T_1_DATE, T_2_DATE
+
+    def get_scan_list(self, trade_date):
+        """
+        获取待扫描的股票列表 (同花顺人气榜或全部A股)
+        """
+        self.log.emit("尝试获取同花顺人气榜...")
+        try:
+            df_hot = self.pro.ths_hot(trade_date=trade_date, type='R', fields='ts_code,name')
+            if not df_hot.empty:
+                self.log.emit(f"成功获取 {len(df_hot)} 只同花顺人气榜股票。")
+                return dict(zip(df_hot.ts_code, df_hot.name))
+            else:
+                self.log.emit("ths_hot 接口未返回数据。")
+        except Exception as e:
+            self.log.emit(f"无法获取 'ths_hot' (Tushare积分不足或API异常): {e}")
+
+        self.log.emit("回退策略：获取所有A股列表进行扫描。")
+        df_all = self.pro.stock_basic(exchange='', list_status='L', fields='ts_code,name')
+        df_all = df_all[~df_all['name'].str.contains('ST')]
+        self.log.emit(f"将扫描 {len(df_all)} 只非ST股票。")
+        return dict(zip(df_all.ts_code, df_all.name))
+
+    def check_stock(self, ts_code, end_date):
+        """
+        检查单个股票是否满足所有筛选条件 (不复权)
+        """
+        try:
+            # a. 获取 "不复权" 日线行情数据
+            df_daily = self.pro.daily(ts_code=ts_code, end_date=end_date, limit=100)
+
+            if df_daily.empty or len(df_daily) < 61:
+                return None
+
+            # b. 手动计算均线
+            df_daily = df_daily.iloc[::-1]  # 升序
+            df_daily['ma5'] = df_daily['close'].rolling(window=5).mean()
+            df_daily['ma10'] = df_daily['close'].rolling(window=10).mean()
+            df_daily['ma20'] = df_daily['close'].rolling(window=20).mean()
+            df_daily['ma60'] = df_daily['close'].rolling(window=60).mean()
+            df_daily = df_daily.iloc[::-1]  # 降序
+
+            # c. 获取每日基本指标 (换手率)
+            df_basic = self.pro.daily_basic(ts_code=ts_code, trade_date=end_date, fields='ts_code,turnover_rate')
+
+            if df_basic.empty:
+                return None
+
+            t1 = df_daily.iloc[0]
+            t2 = df_daily.iloc[1]
+            t1_basic = df_basic.iloc[0]
+
+            if pd.isna(t1['ma60']) or pd.isna(t1['ma5']):
+                return None
+
+            # --- 开始逐条检查 ---
+
+            # 条件1: T-1 (昨天) 必须是阳线
+            if not (t1['close'] > t1['open']):
+                return None
+
+            # 条件1: 五日均线在昨日阳线的实体中
+            if not ((t1['ma5'] >= t1['open']) and (t1['ma5'] <= t1['close'])):
+                return None
+
+            # 条件2: 较上一个交易日放量
+            if not (t1['vol'] > t2['vol']):
+                return None
+
+            # 条件3: 处于上升趋势中 (多头排列)
+            if not ((t1['ma5'] > t1['ma10']) and \
+                    (t1['ma10'] > t1['ma20']) and \
+                    (t1['ma20'] > t1['ma60'])):
+                return None
+
+            # 条件5: 换手率大于10%
+            if not (t1_basic['turnover_rate'] > 10):
+                return None
+
+            # --- 所有条件均满足 ---
+            return ts_code
+
+        except Exception as e:
+            # 记录轻微错误，但继续运行
+            # self.log.emit(f"  [Warn] 处理 {ts_code} 时出错: {e}")
+            return None
 
 
+# -----------------------------------------------------------------
+# 2. 主窗口 (GUI)
+# -----------------------------------------------------------------
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Tushare 股票筛选器 (PyQt5版)")  # [!! 已修改]
+        self.setGeometry(100, 100, 800, 600)
+
+        # --- 初始化UI ---
+        main_widget = QWidget()
+        main_layout = QVBoxLayout()
+        main_widget.setLayout(main_layout)
+        self.setCentralWidget(main_widget)
+
+        # 1. Token 输入行
+        token_layout = QHBoxLayout()
+        token_layout.addWidget(QLabel("Tushare Token:"))
+        self.token_input = QLineEdit()
+        self.token_input.setPlaceholderText("请在这里输入你的Tushare Pro Token")
+        # ！！将你脚本中的Token作为默认值
+        self.token_input.setText("33c189692cf25347cfacb0c27104163a283d9741ff97dd517f13d25b")
+        token_layout.addWidget(self.token_input)
+
+        self.start_button = QPushButton("开始扫描")
+        self.start_button.clicked.connect(self.start_scan)
+        token_layout.addWidget(self.start_button)
+
+        main_layout.addLayout(token_layout)
+
+        # 2. 结果表格
+        main_layout.addWidget(QLabel("扫描结果:"))
+        self.results_table = QTableWidget()
+        self.results_table.setColumnCount(2)
+        self.results_table.setHorizontalHeaderLabels(["股票代码", "股票名称"])
+        # [!! 已修改] PyQt5 使用 QHeaderView.Stretch
+        self.results_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.results_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        # [!! 已修改] PyQt5 使用 QTableWidget.NoEditTriggers
+        self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)  # 禁止编辑
+        main_layout.addWidget(self.results_table)
+
+        # 3. 进度条
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        main_layout.addWidget(self.progress_bar)
+
+        # 4. 日志输出
+        main_layout.addWidget(QLabel("实时日志:"))
+        self.log_output = QTextEdit()
+        self.log_output.setReadOnly(True)
+        self.log_output.setFixedHeight(150)
+        main_layout.addWidget(self.log_output)
+
+        # --- 线程设置 ---
+        self.thread = None
+        self.worker = None
+
+    def start_scan(self):
+        """
+        点击“开始扫描”按钮时触发
+        """
+        if self.worker and self.worker.is_running:
+            # 如果正在运行，按钮变为"停止"
+            self.worker.stop_scan()
+            self.start_button.setText("正在停止...")
+            self.start_button.setEnabled(False)
+            return
+
+        # --- 重置UI ---
+        self.start_button.setText("正在扫描... (点击停止)")
+        self.progress_bar.setValue(0)
+        self.log_output.clear()
+        self.results_table.setRowCount(0)  # 清空表格
+
+        # --- 创建并启动线程 ---
+        self.thread = QThread()
+        self.worker = Worker()
+
+        token = self.token_input.text()
+
+        # 1. 将 worker 移动到 thread
+        self.worker.moveToThread(self.thread)
+
+        # 2. 连接信号和槽
+        #    当线程启动时，调用 worker.run_scan
+        self.thread.started.connect(lambda: self.worker.run_scan(token))
+
+        #    连接 worker 的信号到 GUI 的槽函数
+        self.worker.log.connect(self.append_log)
+        self.worker.progress.connect(self.set_progress)
+        self.worker.found.connect(self.add_stock_to_table)
+        self.worker.finished.connect(self.scan_finished)
+        self.worker.error.connect(self.scan_error)
+
+        #    扫描完成后，自动清理线程
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+
+        # 3. 启动线程
+        self.thread.start()
+
+    # --- GUI 槽函数 ---
+
+    @Slot(str)  # 显式声明为槽
+    def append_log(self, message):
+        """将日志追加到 QTextEdit"""
+        self.log_output.append(message)
+        self.log_output.verticalScrollBar().setValue(self.log_output.verticalScrollBar().maximum())
+
+    @Slot(int)
+    def set_progress(self, value):
+        """设置进度条的值"""
+        self.progress_bar.setValue(value)
+
+    @Slot(str, str)
+    def add_stock_to_table(self, code, name):
+        """向表格中添加一行数据"""
+        row_count = self.results_table.rowCount()
+        self.results_table.insertRow(row_count)
+        self.results_table.setItem(row_count, 0, QTableWidgetItem(code))
+        self.results_table.setItem(row_count, 1, QTableWidgetItem(name))
+
+    def scan_finished(self, final_message):
+        """扫描正常完成时调用"""
+        self.append_log(f"--- {final_message} ---")
+        self.progress_bar.setValue(100)
+        self.start_button.setText("开始扫描")
+        self.start_button.setEnabled(True)
+        self.worker = None  # 清理
+        self.thread = None
+
+    def scan_error(self, error_message):
+        """扫描中发生严重错误时调用"""
+        self.scan_finished("扫描因错误中止。")
+        # 弹窗显示严重错误
+        QMessageBox.critical(self, "扫描出错", error_message)
+
+    def closeEvent(self, event):
+        """关闭窗口时，确保停止工作线程"""
+        if self.worker and self.worker.is_running:
+            self.worker.stop_scan()
+        event.accept()
+
+
+# -----------------------------------------------------------------
+# 3. 主程序入口
+# -----------------------------------------------------------------
 if __name__ == "__main__":
-    pd.set_option('display.float_format', lambda x: '%.2f' % x)
-    main_monitor()
+    # 适配高DPI屏幕 (PyQt5 方式) [!! 已修改]
+    if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+
+    app = QApplication(sys.argv)
+
+    window = MainWindow()
+    window.show()
+
+    # [!! 已修改] PyQt5 使用 app.exec_()
+    sys.exit(app.exec_())
+

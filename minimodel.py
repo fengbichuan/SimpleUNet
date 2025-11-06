@@ -1,0 +1,617 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset  # 假设的，用于替换 get_loaders
+
+# --- 假设的常量 (请替换为你自己的) ---
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DATA_PATH = "./data/"  # 假设
+IMAGE_HEIGHT = 128  # 必须是偶数!
+IMAGE_WIDTH = 128  # 必须是偶数!
+NUM_WORKERS = 2
+PIN_MEMORY = True
+
+
+# ---------------------------------
+
+# 假设的 get_loaders (仅为让代码可运行)
+# 你应该使用你自己的 dataload.py
+class DummyDataset(Dataset):
+    def __init__(self, img_size=(IMAGE_HEIGHT, IMAGE_WIDTH)):
+        self.img_size = img_size
+
+    def __len__(self):
+        return 10
+
+    def __getitem__(self, idx):
+        # 返回一个随机图像和对应的随机掩码
+        img = torch.rand(3, self.img_size[0], self.img_size[1])
+        mask = torch.randint(0, 2, (1, self.img_size[0], self.img_size[1])).float()
+        return img, mask
+
+
+def get_loaders(path, batch_size, height, width, num_workers, pin_memory):
+    ds = DummyDataset(img_size=(height, width))
+    loader = DataLoader(ds, batch_size=batch_size, num_workers=num_workers, pin_memory=pin_memory)
+    return loader, loader  # 返回 train_loader, val_loader
+
+
+# --- 结束假设 ---
+
+
+class TrueMinimalUNet(nn.Module):
+    def __init__(self, in_channels=3, out_channels=1):
+        super().__init__()
+
+        # --- 辅助模块：一个标准的 "Conv -> BatchNorm -> ReLU"x2 块 ---
+        def conv_block(in_c, out_c):
+            return nn.Sequential(
+                nn.Conv2d(in_c, out_c, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(out_c),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_c, out_c, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(out_c),
+                nn.ReLU(inplace=True),
+            )
+
+        # --- Encoder (下采样路径) ---
+        # 1. 输入 -> 16 通道 (H, W)
+        self.enc1 = conv_block(in_channels, 16)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)  # 尺寸 H -> H/2
+
+        # 2. 瓶颈层 (Bottleneck)
+        self.bottleneck = conv_block(16, 32)  # 尺寸 H/2 -> H/2
+
+        # --- Decoder (上采样路径) ---
+        # 1. 上采样：32 -> 16 通道
+        self.upconv1 = nn.ConvTranspose2d(32, 16, kernel_size=2, stride=2)  # 尺寸 H/2 -> H
+
+        # 2. 解码块 (拼接 + 卷积)
+        # 拼接 (concat) 后的通道数 = 16 (来自 upconv1) + 16 (来自 enc1 的跳跃连接)
+        self.dec1 = conv_block(16 + 16, 16)
+
+        # --- 输出层 ---
+        self.out_conv = nn.Conv2d(16, out_channels, kernel_size=1)
+
+        # 正确初始化最后一层
+        nn.init.normal_(self.out_conv.weight, std=0.01)
+        if self.out_conv.bias is not None:
+            nn.init.constant_(self.out_conv.bias, 0.0)
+
+    def forward(self, x):
+        # --- Encoder ---
+        # x 初始: [B, 3, H, W]
+        skip1 = self.enc1(x)  # -> [B, 16, H, W]
+        x_down = self.pool1(skip1)  # -> [B, 16, H/2, W/2]
+
+        # --- Bottleneck ---
+        bottle = self.bottleneck(x_down)  # -> [B, 32, H/2, W/2]
+
+        # --- Decoder ---
+        x_up = self.upconv1(bottle)  # -> [B, 16, H, W]
+
+        # --- 跳跃连接 ---
+        # 沿通道维度 (dim=1) 拼接
+        # 确保你的 H, W 是偶数，否则这里的 H 和 W 可能会差 1 个像素
+        x = torch.cat([x_up, skip1], dim=1)  # -> [B, 16+16, H, W]
+
+        x = self.dec1(x)  # -> [B, 16, H, W]
+
+        # --- Output ---
+        logits = self.out_conv(x)  # -> [B, 1, H, W]
+        return logits
+
+
+def test_true_minimal_model():
+    """测试真正的最小 U-Net 模型"""
+    print("\n=== 真正最小 U-Net 模型测试 ===")
+
+    # 获取数据 (batch_size=1 用于过拟合测试)
+    train_loader, _ = get_loaders(DATA_PATH, 1, IMAGE_HEIGHT, IMAGE_WIDTH, NUM_WORKERS, PIN_MEMORY)
+    data, targets = next(iter(train_loader))
+    data, targets = data.to(DEVICE), targets.to(DEVICE)
+
+    print(f"数据形状: data={data.shape}, targets={targets.shape}")
+
+    # 确保 targets 的值是 0.0 或 1.0 的浮点数
+    if targets.max() > 1.0 or targets.min() < 0.0 or targets.dtype != torch.float32:
+        print(f"警告: Targets (dtype={targets.dtype}, min={targets.min()}, max={targets.max()}) 不是 [0, 1] 浮点数。")
+        targets = (targets > 0.5).float()  # 强制转换
+        print("Targets 已强制转换为 0.0/1.0 浮点数。")
+
+    # 训练最小模型
+    model = TrueMinimalUNet().to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    loss_fn = nn.BCEWithLogitsLoss()  # 适用于 Logits 输出
+
+    print("开始 True Minimal U-Net 训练 (过拟合测试)...")
+    model.train()
+    for epoch in range(500):  # 500 次迭代通常足够过拟合
+        optimizer.zero_grad()
+        predictions = model(data)  # [1, 1, H, W]
+
+        # 确保预测和目标的形状匹配
+        if predictions.shape != targets.shape:
+            print(f"形状不匹配! 预测: {predictions.shape}, 目标: {targets.shape}")
+            break
+
+        loss = loss_fn(predictions, targets)
+        loss.backward()
+        optimizer.step()
+
+        if epoch % 20 == 0 or epoch == 499:
+            with torch.no_grad():
+                probs = torch.sigmoid(predictions)
+                pred_mask = (probs > 0.5).float()
+
+                # 计算 IoU
+                intersection = (pred_mask * targets).sum()
+                union = (pred_mask + targets).clamp(0, 1).sum()
+                iou = (intersection / (union + 1e-6)).item()
+
+                print(f"Epoch {epoch}: Loss = {loss.item():.4f}, IoU = {iou:.4f}")
+
+                # 检查是否成功过拟合
+                if loss.item() < 0.01 and iou > 0.95:
+                    print("\n✓ 成功过拟合! 模型结构和训练流程基本正确。")
+                    return True
+
+
+    return False
+
+
+# --- 主函数调用 ---
+if __name__ == "__main__":
+    # 确保你的 IMAGE_HEIGHT 和 IMAGE_WIDTH 是偶数
+    if IMAGE_HEIGHT % 2 != 0 or IMAGE_WIDTH % 2 != 0:
+        print(f"错误: IMAGE_HEIGHT ({IMAGE_HEIGHT}) 和 IMAGE_WIDTH ({IMAGE_WIDTH}) 必须是偶数才能用于这个最小 U-Net。")
+    else:
+        test_true_minimal_model()
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from thop import profile
+
+# ----------------------------------------------------------------------
+# + 新增: MBRConv5 模块 (结构重参数化) (!!! 按方案A修改 !!!)
+# ----------------------------------------------------------------------
+class MBRConv5(nn.Module):
+    def __init__(self, in_channels, out_channels, rep_scale=4):
+        super(MBRConv5, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # 5x5 卷积分支
+        self.conv = nn.Conv2d(in_channels, out_channels * rep_scale, 5, 1, 2, bias=False)
+        self.conv_bn = nn.Sequential(
+            nn.BatchNorm2d(out_channels * rep_scale)
+        )
+
+        # 1x1 卷积分支
+        self.conv1 = nn.Conv2d(in_channels, out_channels * rep_scale, 1, bias=False)
+        self.conv1_bn = nn.Sequential(
+            nn.BatchNorm2d(out_channels * rep_scale)
+        )
+
+        # 3x3 卷积分支
+        self.conv2 = nn.Conv2d(in_channels, out_channels * rep_scale, 3, 1, 1, bias=False)
+        self.conv2_bn = nn.Sequential(
+            nn.BatchNorm2d(out_channels * rep_scale)
+        )
+
+        # 3x1 卷积分支
+        self.conv_crossh = nn.Conv2d(in_channels, out_channels * rep_scale, (3, 1), 1, (1, 0), bias=False)
+        self.conv_crossh_bn = nn.Sequential(
+            nn.BatchNorm2d(out_channels * rep_scale)
+        )
+
+        # 1x3 卷积分支
+        self.conv_crossv = nn.Conv2d(in_channels, out_channels * rep_scale, (1, 3), 1, (0, 1), bias=False)
+        self.conv_crossv_bn = nn.Sequential(
+            nn.BatchNorm2d(out_channels * rep_scale)
+        )
+
+        # 1x1 融合层
+        self.conv_out = nn.Conv2d(out_channels * rep_scale * 10, out_channels, 1)
+
+        # 重参数化技巧：分离可学习权重和固定权重
+        self.conv_out.weight.requires_grad = False
+        self.weight1 = nn.Parameter(torch.zeros_like(self.conv_out.weight))
+        nn.init.xavier_normal_(self.weight1)
+
+        # (!!!) 方案A：新增 ReLU
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, inp):
+        x1 = self.conv(inp)
+        x2 = self.conv1(inp)
+        x3 = self.conv2(inp)
+        x4 = self.conv_crossh(inp)
+        x5 = self.conv_crossv(inp)
+
+        x = torch.cat(
+            [x1, x2, x3, x4, x5,
+             self.conv_bn(x1),
+             self.conv1_bn(x2),
+             self.conv2_bn(x3),
+             self.conv_crossh_bn(x4),
+             self.conv_crossv_bn(x5)],
+            1
+        )
+
+        final_weight = self.conv_out.weight + self.weight1
+        out = F.conv2d(x, final_weight, self.conv_out.bias)
+
+        # (!!!) 方案A：在末尾应用 ReLU
+        return self.relu(out)
+
+    # slim方法：仅在推理时使用
+    def slim(self):
+        # 辅助函数：融合 Conv 和 BN
+        def fuse_conv_bn(conv, bn):
+            k = 1 / (bn.running_var + bn.eps) ** .5
+            k_unqueezed = k.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+
+            weight = conv.weight * k_unqueezed * bn.weight.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+
+            b_bn = - bn.running_mean / (bn.running_var + bn.eps) ** .5
+            bias = b_bn * bn.weight + bn.bias
+
+            # 如果 conv 有 bias，需要加上
+            if conv.bias is not None:
+                bias = bias + conv.bias * k
+
+            return weight, bias
+
+        # 1. 融合所有 (Conv + BN) 分支
+        conv_w, conv_b = fuse_conv_bn(self.conv, self.conv_bn[0])
+        conv1_w, conv1_b = fuse_conv_bn(self.conv1, self.conv1_bn[0])
+        conv2_w, conv2_b = fuse_conv_bn(self.conv2, self.conv2_bn[0])
+        conv_crossh_w, conv_crossh_b = fuse_conv_bn(self.conv_crossh, self.conv_crossh_bn[0])
+        conv_crossv_w, conv_crossv_b = fuse_conv_bn(self.conv_crossv, self.conv_crossv_bn[0])
+
+        # 2. 融合所有 (仅 Conv) 分支 (模拟一个恒等BN)
+        def get_conv_params(conv):
+            weight = conv.weight
+            bias = torch.zeros(conv.out_channels, device=conv.weight.device)
+            return weight, bias
+
+        conv_pre_w, conv_pre_b = get_conv_params(self.conv)
+        conv1_pre_w, conv1_pre_b = get_conv_params(self.conv1)
+        conv2_pre_w, conv2_pre_b = get_conv_params(self.conv2)
+        conv_crossh_pre_w, conv_crossh_pre_b = get_conv_params(self.conv_crossh)
+        conv_crossv_pre_w, conv_crossv_pre_b = get_conv_params(self.conv_crossv)
+
+        # 3. 将所有非 5x5 核 Pad 到 5x5
+        conv1_w = nn.functional.pad(conv1_w, (2, 2, 2, 2))
+        conv2_w = nn.functional.pad(conv2_w, (1, 1, 1, 1))
+        conv_crossv_w = nn.functional.pad(conv_crossv_w, (1, 1, 2, 2))
+        conv_crossh_w = nn.functional.pad(conv_crossh_w, (2, 2, 1, 1))
+
+        conv1_pre_w = nn.functional.pad(conv1_pre_w, (2, 2, 2, 2))
+        conv2_pre_w = nn.functional.pad(conv2_pre_w, (1, 1, 1, 1))
+        conv_crossv_pre_w = nn.functional.pad(conv_crossv_pre_w, (1, 1, 2, 2))
+        conv_crossh_pre_w = nn.functional.pad(conv_crossh_pre_w, (2, 2, 1, 1))
+
+        # 4. 准备 10 个分支的权重和偏置
+        weight_cat = torch.cat(
+            [conv_pre_w, conv1_pre_w, conv2_pre_w, conv_crossh_pre_w, conv_crossv_pre_w,
+             conv_w, conv1_w, conv2_w, conv_crossh_w, conv_crossv_w],
+            0
+        )
+        bias_cat = torch.cat(
+            [conv_pre_b, conv1_pre_b, conv2_pre_b, conv_crossh_pre_b, conv_crossv_pre_b,
+             conv_b, conv1_b, conv2_b, conv_crossh_b, conv_crossv_b],
+            0
+        )
+
+        # 5. 融合 1x1 卷积 (conv_out)
+        final_conv_weight = self.conv_out.weight + self.weight1
+        final_conv_bias = self.conv_out.bias
+
+        weight_cat_permuted = weight_cat.permute(1, 2, 3, 0)  # (C_in, 5, 5, 10*C_rep)
+        final_conv_weight_squeezed = final_conv_weight.squeeze()  # (C_out, 10*C_rep)
+
+        fused_weight = torch.matmul(weight_cat_permuted, final_conv_weight_squeezed.t())
+        fused_weight = fused_weight.permute(3, 0, 1, 2)  # (C_out, C_in, 5, 5)
+
+        fused_bias = torch.matmul(final_conv_weight_squeezed, bias_cat)
+        if final_conv_bias is not None:
+            fused_bias = fused_bias + final_conv_bias
+
+        # (!!!) 方案A：构造一个融合后的新 Conv+ReLU 模块
+        fused_conv = nn.Conv2d(self.in_channels, self.out_channels, 5, 1, 2, bias=True)
+        fused_conv.weight.data.copy_(fused_weight)
+        fused_conv.bias.data.copy_(fused_bias)
+
+        # (!!!) 方案A：返回一个包含激活的序列，使其与 forward 路径等价
+        return nn.Sequential(fused_conv, self.relu)
+
+
+# ----------------------------------------------------------------------
+# 0. Converse2D 模块 (不变)
+# ----------------------------------------------------------------------
+class Converse2D(nn.Module):
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            kernel_size: int,
+            scale: int = 1,
+            padding: int = 2,
+            padding_mode: str = "circular",
+            eps: float = 1e-5,
+    ):
+        super().__init__()
+        assert out_channels == in_channels, "Converse2D 仅支持 out_channels == in_channels（深度可分）"
+        assert isinstance(scale, int) and scale >= 1, "scale 必须为 >=1 的整数"
+        assert kernel_size > 0 and isinstance(kernel_size, int), "kernel_size 必须为正整数"
+        assert padding_mode in {"reflect", "replicate", "circular", "constant"}, "非法 padding_mode"
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.scale = scale
+        self.padding = padding
+        self.padding_mode = padding_mode
+        self.eps = float(eps)
+        self.weight = nn.Parameter(torch.randn(1, in_channels, kernel_size, kernel_size))
+        with torch.no_grad():
+            w = self.weight.data.view(1, in_channels, -1)
+            self.weight.copy_(F.softmax(w, dim=-1).view_as(self.weight))
+        self.bias = nn.Parameter(torch.zeros(1, in_channels, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        if self.padding > 0:
+            x = F.pad(
+                x,
+                pad=[self.padding, self.padding, self.padding, self.padding],
+                mode=self.padding_mode,
+                value=0.0,
+            )
+        biaseps = torch.sigmoid(self.bias - 9.0) + self.eps  # (1, C, 1, 1)
+        STy = self._s_fold_upsample(x, scale=self.scale)  # (B, C, H*s, W*s)
+        if self.scale != 1:
+            x_nn = F.interpolate(x, scale_factor=self.scale, mode="nearest")
+        else:
+            x_nn = x
+        Hs, Ws = STy.shape[-2:]
+        FB = self._psf2otf(self.weight.to(dtype=x.dtype, device=x.device), (Hs, Ws))  # (1,C,Hs,Ws)
+        FBC = torch.conj(FB)
+        F2B = torch.abs(FB) ** 2
+        FBFy = FBC * torch.fft.fftn(STy, dim=(-2, -1))
+        FR = FBFy + torch.fft.fftn(biaseps * x_nn, dim=(-2, -1))
+        x1 = FB * FR
+        FBR = torch.mean(self._splits(x1, self.scale), dim=-1)  # (B,C,Hs/s,Ws/s)
+        invW = torch.mean(self._splits(F2B, self.scale), dim=-1)  # (1,C,Hs/s,Ws/s)
+        invWBR = FBR / (invW + biaseps + self.eps)
+        FCBinvWBR = FBC * invWBR.repeat(1, 1, self.scale, self.scale)
+        FX = (FR - FCBinvWBR) / (biaseps + self.eps)
+        out = torch.real(torch.fft.ifftn(FX, dim=(-2, -1)))
+        if self.padding > 0:
+            p = self.padding * self.scale
+            out = out[..., p:-p, p:-p]
+        return out
+
+    @staticmethod
+    def _splits(a: torch.Tensor, scale: int) -> torch.Tensor:
+        *lead, W, H = a.size()
+        assert W % scale == 0 and H % scale == 0, "空间尺寸需可被 scale 整除"
+        Ws, Hs = W // scale, H // scale
+        b = a.view(*lead, scale, Ws, scale, Hs)
+        perm = list(range(len(lead))) + [len(lead) + 1, len(lead) + 3, len(lead), len(lead) + 2]
+        b = b.permute(*perm).contiguous()
+        return b.view(*lead, Ws, Hs, scale * scale)
+
+    @staticmethod
+    def _psf2otf(psf: torch.Tensor, shape_hw: tuple[int, int]) -> torch.Tensor:
+        H, W = shape_hw
+        otf = torch.zeros(psf.shape[:-2] + (H, W), dtype=psf.dtype, device=psf.device)
+        otf[..., :psf.shape[-2], :psf.shape[-1]] = psf
+        otf = torch.roll(otf, shifts=(-psf.shape[-2] // 2, -psf.shape[-1] // 2), dims=(-2, -1))
+        return torch.fft.fftn(otf, dim=(-2, -1))
+
+    @staticmethod
+    def _s_fold_upsample(x: torch.Tensor, scale: int) -> torch.Tensor:
+        if scale == 1:
+            return x
+        B, C, H, W = x.shape
+        z = torch.zeros(B, C, H * scale, W * scale, dtype=x.dtype, device=x.device)
+        z[..., ::scale, ::scale] = x
+        return z
+
+
+# ----------------------------------------------------------------------
+# 1. 基础卷积块 (!!! 按方案A修改 !!!)
+# ----------------------------------------------------------------------
+class SingleConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, pad=1, dilation=1):
+        super().__init__()
+
+        # (!!!) 方案A 关键逻辑 (!!!)
+        if kernel_size > 1:
+            # MBRConv5 已经内置了 (Conv + 内部BNs + ReLU)
+            # 所以我们直接使用它，不再需要额外的 BN 或 ReLU
+            self.single_conv = MBRConv5(in_channels, out_channels, rep_scale=4)
+        else:
+            # 1x1 卷积保持原始的 Conv -> BN -> ReLU 结构
+            self.single_conv = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0, dilation=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            )
+
+    def forward(self, x):
+        return self.single_conv(x)
+
+
+# ----------------------------------------------------------------------
+# 2. 编码器 (下采样) 模块 (不变)
+# ----------------------------------------------------------------------
+class Encoder(nn.Module):
+    def __init__(self, in_channels, stage_channels, num_blocks, ks, pad, dilation):
+        super().__init__()
+        self.depth = len(stage_channels)
+        self.down = nn.AvgPool2d(2)
+        self.en_layer0 = SingleConv(in_channels, stage_channels[0], ks, pad, dilation)
+        self.en_layers = nn.ModuleList()
+        for i in range(1, self.depth):
+            layers = []
+            for _ in range(num_blocks[i] - 1):
+                layers.append(SingleConv(stage_channels[i - 1], stage_channels[i - 1], ks, pad, dilation))
+            layers.append(SingleConv(stage_channels[i - 1], stage_channels[i], ks, pad, dilation))
+            self.en_layers.append(nn.Sequential(*layers))
+
+    def forward(self, x):
+        shortcuts = []
+        x = self.en_layer0(x)
+        shortcuts.append(x)
+        for i in range(self.depth - 2):
+            x = self.down(x)
+            x = self.en_layers[i](x)
+            shortcuts.append(x)
+        x = self.down(x)
+        x = self.en_layers[self.depth - 2](x)
+        return x, shortcuts
+
+
+# ----------------------------------------------------------------------
+# 3. 跳跃连接处理模块 (不变)
+# ----------------------------------------------------------------------
+class SkipConnections(nn.Module):
+    def __init__(self, stage_channels, short_rate):
+        super().__init__()
+        self.depth = len(stage_channels)
+        self.short_layers = nn.ModuleList()
+        for i in range(self.depth - 1):
+            layer = SingleConv(stage_channels[i], int(short_rate * stage_channels[i]), 1, 0, 1)
+            self.short_layers.append(layer)
+
+    def forward(self, shortcuts):
+        refined_shortcuts = []
+        for i in range(len(shortcuts)):
+            refined = self.short_layers[i](shortcuts[i])
+            refined_shortcuts.append(refined)
+        return refined_shortcuts
+
+
+# ----------------------------------------------------------------------
+# 4. 瓶颈层 (Bottleneck) 模块 (不变)
+# ----------------------------------------------------------------------
+class Bottleneck(nn.Module):
+    def __init__(self, in_channels, mid_channels, num_blocks, ks, pad, dilation):
+        super().__init__()
+        layers = []
+        layers.append(SingleConv(in_channels, mid_channels, ks, pad, dilation))
+        for _ in range(num_blocks - 1):
+            layers.append(SingleConv(mid_channels, mid_channels, ks, pad, dilation))
+        self.bottleneck_convs = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.bottleneck_convs(x)
+
+
+# ----------------------------------------------------------------------
+# 5. 解码器 (上采样) 模块 (不变)
+# ----------------------------------------------------------------------
+class Decoder(nn.Module):
+    def __init__(self, stage_channels, num_blocks, short_rate,
+                 ks, pad, dilation,
+                 ks_psf=13):
+        super().__init__()
+        self.depth = len(stage_channels)
+        re_stage_channels = stage_channels[::-1]
+        re_num_blocks = num_blocks[::-1]
+        self.de_layers = nn.ModuleList()
+        self.up_layers = nn.ModuleList()
+        up_channels = [int(short_rate * ch) for ch in re_stage_channels]
+        for i in range(self.depth - 1):
+            current_up_channels = up_channels[i]
+            self.up_layers.append(
+                Converse2D(
+                    in_channels=current_up_channels,
+                    out_channels=current_up_channels,
+                    kernel_size=ks_psf,
+                    scale=2,
+                    padding=ks_psf // 2,
+                    padding_mode="circular"
+                )
+            )
+            de_layers_block = []
+            in_ch_concat = up_channels[i] + int(short_rate * re_stage_channels[i + 1])
+            out_ch = int(short_rate * re_stage_channels[i + 1])
+            de_layers_block.append(SingleConv(in_ch_concat, out_ch, ks, pad, dilation))
+            for _ in range(re_num_blocks[i + 1] - 1):
+                de_layers_block.append(SingleConv(out_ch, out_ch, ks, pad, dilation))
+            self.de_layers.append(nn.Sequential(*de_layers_block))
+
+    def forward(self, x_from_bottleneck, refined_shortcuts):
+        re_shortcuts = refined_shortcuts[::-1]
+        x = x_from_bottleneck
+        for j in range(self.depth - 1):
+            x_up_simple = F.interpolate(
+                x,
+                scale_factor=2,
+                mode='bilinear',
+                align_corners=False
+            )
+            x_up_complex = self.up_layers[j](x)
+            x_up = x_up_simple + x_up_complex
+            shortcut = re_shortcuts[j]
+            y = torch.concat([shortcut, x_up], dim=1)
+            x = self.de_layers[j](y)
+        return x
+
+
+# ----------------------------------------------------------------------
+# 6. 重构后的 SimpleUNet (主模块) (不变)
+# ----------------------------------------------------------------------
+
+
+
+
+class SimpleUNet(nn.Module):
+    def __init__(self, in_channels, num_cls, ks=3, dilation=1,
+                 stage_channels=5 * [32], num_blocks=5 * [1], short_rate=0.5,
+                 ks_psf=13):
+        super(SimpleUNet, self).__init__()
+        assert short_rate > 0, 'short_rate must be greater than 0!'
+        assert len(stage_channels) == len(num_blocks), 'The length of stage_channels and num_blocks must match!'
+        self.pad = dilation * (ks - 1) // 2
+        self.encoder = Encoder(in_channels, stage_channels, num_blocks, ks, self.pad, dilation)
+        self.skip_connections = SkipConnections(stage_channels, short_rate)
+        self.bottleneck = Bottleneck(
+            in_channels=stage_channels[-1],
+            mid_channels=int(short_rate * stage_channels[-1]),
+            num_blocks=num_blocks[-1],
+            ks=ks,
+            pad=self.pad,
+            dilation=dilation
+        )
+        self.decoder = Decoder(stage_channels, num_blocks, short_rate,
+                               ks, self.pad, dilation,
+                               ks_psf=ks_psf)
+        self.seg_head = SingleConv(int(short_rate * stage_channels[0]), num_cls, 1, 0, 1)
+
+    def forward(self, x):
+        x_to_bottleneck, shortcuts = self.encoder(x)
+        refined_shortcuts = self.skip_connections(shortcuts)
+        x_after_bottleneck = self.bottleneck(x_to_bottleneck)
+        x = self.decoder(x_after_bottleneck, refined_shortcuts)
+        output = self.seg_head(x)
+        return output
+
+
+if __name__ == '__main__':
+        input = torch.randn(1, 3, 256, 256).cuda()
+        model = SimpleUNet(in_channels=3, num_cls=1, stage_channels=[16, 16, 16, 16, 16], num_blocks=[1, 1, 1, 1, 1],
+                           short_rate=0.5).cuda()
+        flops, params = profile(model, inputs=(input,))
+        output = model(input)
+        print("Size", output.shape)
+        print(flops / 1e9)
+        print(params / 1e6)

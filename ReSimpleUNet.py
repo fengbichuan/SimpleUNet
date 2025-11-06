@@ -1,169 +1,124 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from thop import profile
+from functools import partial
+
+# (!!! 新增 !!!) 导入 timm 库用于权重初始化
+import timm
+from timm.models.layers import trunc_normal_tf_
+from timm.models.helpers import named_apply
 
 
 # ----------------------------------------------------------------------
-# + 新增: MBRConv5 模块 (结构重参数化) (!!! 按方案A修改 !!!)
+# (!!! 新增 !!!) 0. 来自 MK_UNet 的依赖项 (AG模块需要)
 # ----------------------------------------------------------------------
-class MBRConv5(nn.Module):
-    def __init__(self, in_channels, out_channels, rep_scale=4):
-        super(MBRConv5, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
 
-        # 5x5 卷积分支
-        self.conv = nn.Conv2d(in_channels, out_channels * rep_scale, 5, 1, 2, bias=False)
-        self.conv_bn = nn.Sequential(
-            nn.BatchNorm2d(out_channels * rep_scale)
-        )
+def _init_weights(module, name, scheme=''):
+    """ 来自 MK_UNet 的权重初始化辅助函数 """
+    if isinstance(module, nn.Conv2d):
+        if scheme == 'normal':
+            nn.init.normal_(module.weight, std=.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif scheme == 'trunc_normal':
+            trunc_normal_tf_(module.weight, std=.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif scheme == 'xavier_normal':
+            nn.init.xavier_normal_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif scheme == 'kaiming_normal':
+            nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        else:
+            # efficientnet like
+            fan_out = module.kernel_size[0] * module.kernel_size[1] * module.out_channels
+            fan_out //= module.groups
+            nn.init.normal_(module.weight, 0, math.sqrt(2.0 / fan_out))
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.BatchNorm2d):
+        nn.init.constant_(module.weight, 1)
+        nn.init.constant_(module.bias, 0)
+    elif isinstance(module, nn.LayerNorm):
+        nn.init.constant_(module.weight, 1)
+        nn.init.constant_(module.bias, 0)
 
-        # 1x1 卷积分支
-        self.conv1 = nn.Conv2d(in_channels, out_channels * rep_scale, 1, bias=False)
-        self.conv1_bn = nn.Sequential(
-            nn.BatchNorm2d(out_channels * rep_scale)
-        )
 
-        # 3x3 卷积分支
-        self.conv2 = nn.Conv2d(in_channels, out_channels * rep_scale, 3, 1, 1, bias=False)
-        self.conv2_bn = nn.Sequential(
-            nn.BatchNorm2d(out_channels * rep_scale)
-        )
-
-        # 3x1 卷积分支
-        self.conv_crossh = nn.Conv2d(in_channels, out_channels * rep_scale, (3, 1), 1, (1, 0), bias=False)
-        self.conv_crossh_bn = nn.Sequential(
-            nn.BatchNorm2d(out_channels * rep_scale)
-        )
-
-        # 1x3 卷积分支
-        self.conv_crossv = nn.Conv2d(in_channels, out_channels * rep_scale, (1, 3), 1, (0, 1), bias=False)
-        self.conv_crossv_bn = nn.Sequential(
-            nn.BatchNorm2d(out_channels * rep_scale)
-        )
-
-        # 1x1 融合层
-        self.conv_out = nn.Conv2d(out_channels * rep_scale * 10, out_channels, 1)
-
-        # 重参数化技巧：分离可学习权重和固定权重
-        self.conv_out.weight.requires_grad = False
-        self.weight1 = nn.Parameter(torch.zeros_like(self.conv_out.weight))
-        nn.init.xavier_normal_(self.weight1)
-
-        # (!!!) 方案A：新增 ReLU
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, inp):
-        x1 = self.conv(inp)
-        x2 = self.conv1(inp)
-        x3 = self.conv2(inp)
-        x4 = self.conv_crossh(inp)
-        x5 = self.conv_crossv(inp)
-
-        x = torch.cat(
-            [x1, x2, x3, x4, x5,
-             self.conv_bn(x1),
-             self.conv1_bn(x2),
-             self.conv2_bn(x3),
-             self.conv_crossh_bn(x4),
-             self.conv_crossv_bn(x5)],
-            1
-        )
-
-        final_weight = self.conv_out.weight + self.weight1
-        out = F.conv2d(x, final_weight, self.conv_out.bias)
-
-        # (!!!) 方案A：在末尾应用 ReLU
-        return self.relu(out)
-
-    # slim方法：仅在推理时使用
-    def slim(self):
-        # 辅助函数：融合 Conv 和 BN
-        def fuse_conv_bn(conv, bn):
-            k = 1 / (bn.running_var + bn.eps) ** .5
-            k_unqueezed = k.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-
-            weight = conv.weight * k_unqueezed * bn.weight.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-
-            b_bn = - bn.running_mean / (bn.running_var + bn.eps) ** .5
-            bias = b_bn * bn.weight + bn.bias
-
-            # 如果 conv 有 bias，需要加上
-            if conv.bias is not None:
-                bias = bias + conv.bias * k
-
-            return weight, bias
-
-        # 1. 融合所有 (Conv + BN) 分支
-        conv_w, conv_b = fuse_conv_bn(self.conv, self.conv_bn[0])
-        conv1_w, conv1_b = fuse_conv_bn(self.conv1, self.conv1_bn[0])
-        conv2_w, conv2_b = fuse_conv_bn(self.conv2, self.conv2_bn[0])
-        conv_crossh_w, conv_crossh_b = fuse_conv_bn(self.conv_crossh, self.conv_crossh_bn[0])
-        conv_crossv_w, conv_crossv_b = fuse_conv_bn(self.conv_crossv, self.conv_crossv_bn[0])
-
-        # 2. 融合所有 (仅 Conv) 分支 (模拟一个恒等BN)
-        def get_conv_params(conv):
-            weight = conv.weight
-            bias = torch.zeros(conv.out_channels, device=conv.weight.device)
-            return weight, bias
-
-        conv_pre_w, conv_pre_b = get_conv_params(self.conv)
-        conv1_pre_w, conv1_pre_b = get_conv_params(self.conv1)
-        conv2_pre_w, conv2_pre_b = get_conv_params(self.conv2)
-        conv_crossh_pre_w, conv_crossh_pre_b = get_conv_params(self.conv_crossh)
-        conv_crossv_pre_w, conv_crossv_pre_b = get_conv_params(self.conv_crossv)
-
-        # 3. 将所有非 5x5 核 Pad 到 5x5
-        conv1_w = nn.functional.pad(conv1_w, (2, 2, 2, 2))
-        conv2_w = nn.functional.pad(conv2_w, (1, 1, 1, 1))
-        conv_crossv_w = nn.functional.pad(conv_crossv_w, (1, 1, 2, 2))
-        conv_crossh_w = nn.functional.pad(conv_crossh_w, (2, 2, 1, 1))
-
-        conv1_pre_w = nn.functional.pad(conv1_pre_w, (2, 2, 2, 2))
-        conv2_pre_w = nn.functional.pad(conv2_pre_w, (1, 1, 1, 1))
-        conv_crossv_pre_w = nn.functional.pad(conv_crossv_pre_w, (1, 1, 2, 2))
-        conv_crossh_pre_w = nn.functional.pad(conv_crossh_pre_w, (2, 2, 1, 1))
-
-        # 4. 准备 10 个分支的权重和偏置
-        weight_cat = torch.cat(
-            [conv_pre_w, conv1_pre_w, conv2_pre_w, conv_crossh_pre_w, conv_crossv_pre_w,
-             conv_w, conv1_w, conv2_w, conv_crossh_w, conv_crossv_w],
-            0
-        )
-        bias_cat = torch.cat(
-            [conv_pre_b, conv1_pre_b, conv2_pre_b, conv_crossh_pre_b, conv_crossv_pre_b,
-             conv_b, conv1_b, conv2_b, conv_crossh_b, conv_crossv_b],
-            0
-        )
-
-        # 5. 融合 1x1 卷积 (conv_out)
-        final_conv_weight = self.conv_out.weight + self.weight1
-        final_conv_bias = self.conv_out.bias
-
-        weight_cat_permuted = weight_cat.permute(1, 2, 3, 0)  # (C_in, 5, 5, 10*C_rep)
-        final_conv_weight_squeezed = final_conv_weight.squeeze()  # (C_out, 10*C_rep)
-
-        fused_weight = torch.matmul(weight_cat_permuted, final_conv_weight_squeezed.t())
-        fused_weight = fused_weight.permute(3, 0, 1, 2)  # (C_out, C_in, 5, 5)
-
-        fused_bias = torch.matmul(final_conv_weight_squeezed, bias_cat)
-        if final_conv_bias is not None:
-            fused_bias = fused_bias + final_conv_bias
-
-        # (!!!) 方案A：构造一个融合后的新 Conv+ReLU 模块
-        fused_conv = nn.Conv2d(self.in_channels, self.out_channels, 5, 1, 2, bias=True)
-        fused_conv.weight.data.copy_(fused_weight)
-        fused_conv.bias.data.copy_(fused_bias)
-
-        # (!!!) 方案A：返回一个包含激活的序列，使其与 forward 路径等价
-        return nn.Sequential(fused_conv, self.relu)
+def act_layer(act, inplace=False, neg_slope=0.2, n_prelu=1):
+    """ 来自 MK_UNet 的激活层辅助函数 """
+    act = act.lower()
+    if act == 'relu':
+        layer = nn.ReLU(inplace)
+    elif act == 'relu6':
+        layer = nn.ReLU6(inplace)
+    elif act == 'leakyrelu':
+        layer = nn.LeakyReLU(neg_slope, inplace)
+    elif act == 'prelu':
+        layer = nn.PReLU(num_parameters=n_prelu, init=neg_slope)
+    elif act == 'gelu':
+        layer = nn.GELU()
+    elif act == 'hswish':
+        layer = nn.Hardswish(inplace)
+    else:
+        raise NotImplementedError('activation layer [%s] is not found' % act)
+    return layer
 
 
 # ----------------------------------------------------------------------
-# 0. Converse2D 模块 (不变)
+# (!!! 新增 !!!) 1. GroupedAttentionGate 模块 (来自 MK_UNet)
+# ----------------------------------------------------------------------
+class GroupedAttentionGate(nn.Module):
+    def __init__(self, F_g, F_l, F_int, kernel_size=1, groups=1, activation='relu'):
+        super(GroupedAttentionGate, self).__init__()
+        if kernel_size == 1:
+            groups = 1
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, groups=groups,
+                      bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=kernel_size, stride=1, padding=kernel_size // 2, groups=groups,
+                      bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+
+        self.activation = act_layer(activation, inplace=True)
+
+        self.init_weights('normal')
+
+    def init_weights(self, scheme=''):
+        named_apply(partial(_init_weights, scheme=scheme), self)
+
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.activation(g1 + x1)
+        psi = self.psi(psi)
+
+        return x * psi
+
+
+# ----------------------------------------------------------------------
+# 2. 您提供的 Converse2D 模块 (不变)
 # ----------------------------------------------------------------------
 class Converse2D(nn.Module):
+    """
+    Converse2D: 频域闭式解型上采样-去卷积算子（深度可分）
+    """
+
     def __init__(
             self,
             in_channels: int,
@@ -175,6 +130,7 @@ class Converse2D(nn.Module):
             eps: float = 1e-5,
     ):
         super().__init__()
+        # --- 参数与约束 ---
         assert out_channels == in_channels, "Converse2D 仅支持 out_channels == in_channels（深度可分）"
         assert isinstance(scale, int) and scale >= 1, "scale 必须为 >=1 的整数"
         assert kernel_size > 0 and isinstance(kernel_size, int), "kernel_size 必须为正整数"
@@ -187,14 +143,20 @@ class Converse2D(nn.Module):
         self.padding = padding
         self.padding_mode = padding_mode
         self.eps = float(eps)
+
+        # 卷积核与偏置（每通道一核）
         self.weight = nn.Parameter(torch.randn(1, in_channels, kernel_size, kernel_size))
         with torch.no_grad():
             w = self.weight.data.view(1, in_channels, -1)
-            self.weight.copy_(F.softmax(w, dim=-1).view_as(self.weight))
-        self.bias = nn.Parameter(torch.zeros(1, in_channels, 1, 1))
+            self.weight.copy_(F.softmax(w, dim=-1).view_as(self.weight))  # 核归一化（按通道）
 
+        self.bias = nn.Parameter(torch.zeros(1, in_channels, 1, 1))  # 可学习先验强度
+
+    # ----------------- 主流程 -----------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
+
+        # 边界填充（在空域，匹配 s-fold 上采样后裁剪）
         if self.padding > 0:
             x = F.pad(
                 x,
@@ -202,42 +164,68 @@ class Converse2D(nn.Module):
                 mode=self.padding_mode,
                 value=0.0,
             )
-        biaseps = torch.sigmoid(self.bias - 9.0) + self.eps  # (1, C, 1, 1)
+
+        # 正则/先验强度（>0）
+        biaseps = torch.sigmoid(self.bias - 9.0) + self.eps  # 形状 (1, C, 1, 1)
+
+        # s-fold 上采样（零填充）
         STy = self._s_fold_upsample(x, scale=self.scale)  # (B, C, H*s, W*s)
+
+        # 供对比的最近邻上采（不参与公式，仅保留你原始注释思想）
         if self.scale != 1:
             x_nn = F.interpolate(x, scale_factor=self.scale, mode="nearest")
         else:
             x_nn = x
+
         Hs, Ws = STy.shape[-2:]
         FB = self._psf2otf(self.weight.to(dtype=x.dtype, device=x.device), (Hs, Ws))  # (1,C,Hs,Ws)
         FBC = torch.conj(FB)
         F2B = torch.abs(FB) ** 2
+
+        # 右端项：FBC * FFT(STy)
         FBFy = FBC * torch.fft.fftn(STy, dim=(-2, -1))
+
+        # FR = FBFy + FFT(biaseps * x)
         FR = FBFy + torch.fft.fftn(biaseps * x_nn, dim=(-2, -1))
+
+        # 频域闭式解各项
         x1 = FB * FR
         FBR = torch.mean(self._splits(x1, self.scale), dim=-1)  # (B,C,Hs/s,Ws/s)
         invW = torch.mean(self._splits(F2B, self.scale), dim=-1)  # (1,C,Hs/s,Ws/s)
-        invWBR = FBR / (invW + biaseps + self.eps)
-        FCBinvWBR = FBC * invWBR.repeat(1, 1, self.scale, self.scale)
+        invWBR = FBR / (invW + biaseps + self.eps)  # 稳定除法
+
+        # 重构
+        FCBinvWBR = FBC * invWBR.repeat(1, 1, self.scale, self.scale)  # broadcast 回到 (B,C,Hs,Ws)
         FX = (FR - FCBinvWBR) / (biaseps + self.eps)
         out = torch.real(torch.fft.ifftn(FX, dim=(-2, -1)))
+
+        # 去除之前的 padding（注意要按放大后的步长裁剪）
         if self.padding > 0:
             p = self.padding * self.scale
             out = out[..., p:-p, p:-p]
+
         return out
 
+    # ----------------- 工具函数 -----------------
     @staticmethod
     def _splits(a: torch.Tensor, scale: int) -> torch.Tensor:
+        """
+        将 (..., W, H) 切分为 (..., W/scale, H/scale, scale^2)，用于频域子采样平均。
+        """
         *lead, W, H = a.size()
         assert W % scale == 0 and H % scale == 0, "空间尺寸需可被 scale 整除"
         Ws, Hs = W // scale, H // scale
         b = a.view(*lead, scale, Ws, scale, Hs)
+        # 将两个 scale 维并到最后
         perm = list(range(len(lead))) + [len(lead) + 1, len(lead) + 3, len(lead), len(lead) + 2]
         b = b.permute(*perm).contiguous()
         return b.view(*lead, Ws, Hs, scale * scale)
 
     @staticmethod
     def _psf2otf(psf: torch.Tensor, shape_hw: tuple[int, int]) -> torch.Tensor:
+        """
+        PSF -> OTF：把 PSF 放到左上角，roll 到中心，再做 FFT，得到 (N=1, C, H, W) 的 OTF。
+        """
         H, W = shape_hw
         otf = torch.zeros(psf.shape[:-2] + (H, W), dtype=psf.dtype, device=psf.device)
         otf[..., :psf.shape[-2], :psf.shape[-1]] = psf
@@ -246,6 +234,9 @@ class Converse2D(nn.Module):
 
     @staticmethod
     def _s_fold_upsample(x: torch.Tensor, scale: int) -> torch.Tensor:
+        """
+        s-fold 上采样：在 (H*s, W*s) 的网格上每隔 s 填一个原像素，其余为 0。
+        """
         if scale == 1:
             return x
         B, C, H, W = x.shape
@@ -255,37 +246,30 @@ class Converse2D(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 1. 基础卷积块 (!!! 按方案A修改 !!!)
+# 3. 基础卷积块 (不变)
 # ----------------------------------------------------------------------
 class SingleConv(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, pad=1, dilation=1):
         super().__init__()
-
-        # (!!!) 方案A 关键逻辑 (!!!)
-        if kernel_size > 1:
-            # MBRConv5 已经内置了 (Conv + 内部BNs + ReLU)
-            # 所以我们直接使用它，不再需要额外的 BN 或 ReLU
-            self.single_conv = MBRConv5(in_channels, out_channels, rep_scale=4)
-        else:
-            # 1x1 卷积保持原始的 Conv -> BN -> ReLU 结构
-            self.single_conv = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, padding=0, dilation=1, bias=False),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True)
-            )
+        self.single_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=pad, dilation=dilation, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
     def forward(self, x):
         return self.single_conv(x)
 
 
 # ----------------------------------------------------------------------
-# 2. 编码器 (下采样) 模块 (不变)
+# 4. 编码器 (下采样) 模块 (不变)
 # ----------------------------------------------------------------------
 class Encoder(nn.Module):
     def __init__(self, in_channels, stage_channels, num_blocks, ks, pad, dilation):
         super().__init__()
         self.depth = len(stage_channels)
-        self.down = nn.AvgPool2d(2)
+        self.down = nn.MaxPool2d(2)
+
         self.en_layer0 = SingleConv(in_channels, stage_channels[0], ks, pad, dilation)
         self.en_layers = nn.ModuleList()
         for i in range(1, self.depth):
@@ -309,7 +293,7 @@ class Encoder(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 3. 跳跃连接处理模块 (不变)
+# 5. 跳跃连接处理模块 (不变)
 # ----------------------------------------------------------------------
 class SkipConnections(nn.Module):
     def __init__(self, stage_channels, short_rate):
@@ -329,7 +313,7 @@ class SkipConnections(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 4. 瓶颈层 (Bottleneck) 模块 (不变)
+# 6. 瓶颈层 (Bottleneck) 模块 (不变)
 # ----------------------------------------------------------------------
 class Bottleneck(nn.Module):
     def __init__(self, in_channels, mid_channels, num_blocks, ks, pad, dilation):
@@ -345,68 +329,120 @@ class Bottleneck(nn.Module):
 
 
 # ----------------------------------------------------------------------
-# 5. 解码器 (上采样) 模块 (不变)
+# 7. 解码器 (上采样) 模块 (!!! 已修改 !!!)
 # ----------------------------------------------------------------------
 class Decoder(nn.Module):
-    def __init__(self, stage_channels, num_blocks, short_rate,
-                 ks, pad, dilation,
-                 ks_psf=13):
+    """
+    U-Net的解码器（上采样）路径。
+    使用 Converse2D 作为上采样层。
+    (!!! 已修改 !!!) 集成了 GroupedAttentionGate (AG)。
+    """
+
+    def __init__(self, stage_channels, num_blocks, short_rate, ks, pad, dilation):
         super().__init__()
+
         self.depth = len(stage_channels)
         re_stage_channels = stage_channels[::-1]
         re_num_blocks = num_blocks[::-1]
+
+        # 1. 解码器层 (de_layer0, de_layer1, ...)
         self.de_layers = nn.ModuleList()
+
+        # 2. Converse2D 上采样层
         self.up_layers = nn.ModuleList()
+
+        # (!!! 新增 !!!) 3. 注意力门 (Attention Gate) 层
+        self.ag_layers = nn.ModuleList()
+
+        # 计算解码器路径中，输入到 *上采样层* 的特征图通道数
         up_channels = [int(short_rate * ch) for ch in re_stage_channels]
-        for i in range(self.depth - 1):
+
+        for i in range(self.depth - 1):  # 循环 (depth-1) 次
+
+            # (!!! 步骤 1: 创建 Converse2D 上采样层 - 不变 !!!)
             current_up_channels = up_channels[i]
             self.up_layers.append(
                 Converse2D(
                     in_channels=current_up_channels,
                     out_channels=current_up_channels,
-                    kernel_size=ks_psf,
+                    kernel_size=ks,
                     scale=2,
-                    padding=ks_psf // 2,
+                    padding=pad,
                     padding_mode="circular"
                 )
             )
+
+            # (!!! 步骤 2: (!!! 新增 !!!) 创建 Attention Gate !!!)
+            # F_g: Gating 信号 (来自上采样路径)，通道数 = current_up_channels
+            F_g = current_up_channels
+            # F_l: Skip Connection 信号 (来自编码器)，通道数
+            F_l = int(short_rate * re_stage_channels[i + 1])
+            # F_int: AG 内部中间通道数，设为 F_l 的一半 (与 MK_UNet 保持一致)
+            F_int = max(1, F_l // 2)
+
+            self.ag_layers.append(
+                GroupedAttentionGate(
+                    F_g=F_g,
+                    F_l=F_l,
+                    F_int=F_int,
+                    kernel_size=ks,  # 复用 ks
+                    groups=max(1, F_int)  # 仿照 MK_UNet 设置 groups = F_int
+                )
+            )
+
+            # (!!! 步骤 3: 创建解码器卷积块 - 不变 !!!)
+            # 拼接后的输入通道计算保持不变 (来自 AG 的输出通道 F_l + 来自上采样的 F_g)
+            in_ch_concat = F_l + F_g
+            out_ch = int(short_rate * re_stage_channels[i + 1])  # (即 up_channels[i+1])
+
             de_layers_block = []
-            in_ch_concat = up_channels[i] + int(short_rate * re_stage_channels[i + 1])
-            out_ch = int(short_rate * re_stage_channels[i + 1])
             de_layers_block.append(SingleConv(in_ch_concat, out_ch, ks, pad, dilation))
             for _ in range(re_num_blocks[i + 1] - 1):
                 de_layers_block.append(SingleConv(out_ch, out_ch, ks, pad, dilation))
+
             self.de_layers.append(nn.Sequential(*de_layers_block))
 
     def forward(self, x_from_bottleneck, refined_shortcuts):
+        # 将跳跃连接反转，以便从深到浅使用
         re_shortcuts = refined_shortcuts[::-1]
-        x = x_from_bottleneck
-        for j in range(self.depth - 1):
-            x_up_simple = F.interpolate(
-                x,
-                scale_factor=2,
-                mode='bilinear',
-                align_corners=False
-            )
-            x_up_complex = self.up_layers[j](x)
-            x_up = x_up_simple + x_up_complex
+
+        x = x_from_bottleneck  # 从瓶颈层的输出开始
+
+        # 循环上采样
+        for j in range(self.depth - 1):  # 循环 (depth-1) 次
+
+            # 1. 使用 Converse2D 进行上采样 (gating 信号)
+            x_up = self.up_layers[j](x)
+
+            # 2. 获取对应的跳跃连接 (skip 信号)
             shortcut = re_shortcuts[j]
-            y = torch.concat([shortcut, x_up], dim=1)
+
+            # (!!! 步骤 3: (!!! 已修改 !!!) 应用注意力门 !!!)
+            # g = Gating 信号 (来自上采样路径 x_up)
+            # x = Skip 信号 (来自编码器路径 shortcut)
+            attended_shortcut = self.ag_layers[j](g=x_up, x=shortcut)
+
+            # (!!! 步骤 4: (!!! 已修改 !!!) 拼接经 AG 处理后的 shortcut !!!)
+            y = torch.concat([attended_shortcut, x_up], dim=1)
+
+            # 5. 通过解码器卷积块
             x = self.de_layers[j](y)
-        return x
+
+        return x  # 返回解码器最后一层的输出
 
 
 # ----------------------------------------------------------------------
-# 6. 重构后的 SimpleUNet (主模块) (不变)
+# 8. 重构后的 SimpleUNet (主模块) (不变)
 # ----------------------------------------------------------------------
 class SimpleUNet(nn.Module):
-    def __init__(self, in_channels, num_cls, ks=3, dilation=1,
-                 stage_channels=5 * [32], num_blocks=5 * [1], short_rate=0.5,
-                 ks_psf=13):
+    def __init__(self, in_channels, num_cls, ks=3, dilation=1, stage_channels=5 * [32], num_blocks=5 * [1],
+                 short_rate=0.5):
         super(SimpleUNet, self).__init__()
         assert short_rate > 0, 'short_rate must be greater than 0!'
         assert len(stage_channels) == len(num_blocks), 'The length of stage_channels and num_blocks must match!'
+
         self.pad = dilation * (ks - 1) // 2
+
         self.encoder = Encoder(in_channels, stage_channels, num_blocks, ks, self.pad, dilation)
         self.skip_connections = SkipConnections(stage_channels, short_rate)
         self.bottleneck = Bottleneck(
@@ -417,9 +453,9 @@ class SimpleUNet(nn.Module):
             pad=self.pad,
             dilation=dilation
         )
-        self.decoder = Decoder(stage_channels, num_blocks, short_rate,
-                               ks, self.pad, dilation,
-                               ks_psf=ks_psf)
+        # (!!! 注意 !!!)
+        # 这里的 Decoder 初始化调用不变，修改已在其内部完成
+        self.decoder = Decoder(stage_channels, num_blocks, short_rate, ks, self.pad, dilation)
         self.seg_head = SingleConv(int(short_rate * stage_channels[0]), num_cls, 1, 0, 1)
 
     def forward(self, x):
@@ -429,3 +465,33 @@ class SimpleUNet(nn.Module):
         x = self.decoder(x_after_bottleneck, refined_shortcuts)
         output = self.seg_head(x)
         return output
+
+
+# ----------------------------------------------------------------------
+# 9. 测试代码 (不变)
+# ----------------------------------------------------------------------
+if __name__ == '__main__':
+    # 确保有可用的CUDA设备
+    if torch.cuda.is_available():
+        input = torch.randn(1, 3, 256, 256).cuda()
+
+        # 使用的参数 (ks=3, pad=1)
+        model = SimpleUNet(
+            in_channels=3,
+            num_cls=1,
+            ks=3,
+            stage_channels=[16, 16, 16, 16, 16],  # 通道数可以调大，例如 [32, 64, 128, 256, 512]
+            num_blocks=[1, 1, 1, 1, 1],
+            short_rate=0.5
+        ).cuda()
+
+        flops, params = profile(model, inputs=(input,))
+        output = model(input)
+
+        print(f"\n--- Final Model Output (with Converse2D + Attention Gates) ---")
+        print(f"Input shape: {input.shape}")
+        print(f"Output shape: {output.shape}")
+        print(f"FLOPs (G): {flops / 1e9}")
+        print(f"Params (M): {params / 1e6}")
+    else:
+        print("CUDA not available. Please run this on a machine with a GPU.")
